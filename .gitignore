@@ -20,6 +20,9 @@ Thumbs.db
 # Project docs (local only)
 DECISION.md
 WALKTHROUGH.md
+testGraph/
+implementation_plan.md
+implementation.pdf
 
 # Virtual environment
 venv/
