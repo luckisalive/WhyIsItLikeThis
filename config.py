@@ -1,0 +1,63 @@
+"""
+Central configuration management using Pydantic Settings.
+Loads from .env file automatically.
+"""
+
+from pydantic_settings import BaseSettings
+from pydantic import Field
+
+
+class Settings(BaseSettings):
+    """Application settings loaded from environment variables / .env file."""
+
+    # Neo4j AuraDB
+    neo4j_uri: str = Field(default="NEO4J_URI", description="Neo4j AuraDB connection URI (neo4j+s://...)")
+    neo4j_username: str = Field(default="neo4j", description="Neo4j username")
+    neo4j_password: str = Field(default="NEO4J_PASSWORD", description="Neo4j password")
+
+    # GitHub
+    github_token: str = Field(default="GITHUB_TOKEN", description="GitHub Personal Access Token")
+
+    # Groq Cloud (extraction LLM)
+    groq_api_key: str = Field(default="GROQ_API_KEY", description="Groq Cloud API key")
+
+    # Google Gemini (reasoning LLM + embeddings)
+    google_api_key: str = Field(default="GOOGLE_API_KEY", description="Google Gemini API key")
+
+    # Target Repository
+    target_repo: str = Field(
+        default="tiangolo/fastapi",
+        description="GitHub repository to analyze (owner/name)",
+    )
+
+    # Ingestion controls
+    max_commits: int = Field(default=500, description="Max commits to ingest")
+    max_prs: int = Field(default=300, description="Max pull requests to ingest")
+    max_issues: int = Field(default=200, description="Max issues to ingest")
+    batch_size: int = Field(default=10, description="LLM extraction batch size")
+
+    # Embedding
+    embedding_model: str = Field(
+        default="models/text-embedding-004",
+        description="Gemini embedding model name",
+    )
+    embedding_dimensions: int = Field(default=768, description="Embedding vector dimensions")
+
+    # Groq model
+    groq_model: str = Field(
+        default="llama-3.1-70b-versatile",
+        description="Groq model for decision extraction",
+    )
+
+    # Gemini model
+    gemini_model: str = Field(
+        default="gemini-2.0-flash",
+        description="Gemini model for final reasoning",
+    )
+
+    model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
+
+
+def get_settings() -> Settings:
+    """Factory to create and cache settings instance."""
+    return Settings()

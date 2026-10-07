@@ -1,0 +1,35 @@
+# Environment
+.env
+__pycache__/
+*.pyc
+*.pyo
+
+# Data
+data/
+github_cache.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project docs (local only)
+DECISION.md
+WALKTHROUGH.md
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Distribution
+*.egg-info/
+dist/
+build/
+
+# Streamlit
+.streamlit/

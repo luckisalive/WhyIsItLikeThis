@@ -1,0 +1,29 @@
+# Neo4j
+neo4j>=5.18.0
+
+# GraphRAG
+neo4j-graphrag>=1.0.0
+
+# GitHub API
+PyGithub>=2.1.0
+
+# LLM Providers
+groq>=0.9.0
+google-generativeai>=0.8.0
+
+# Code Parsing
+tree-sitter>=0.22.0
+tree-sitter-python>=0.23.0
+
+# UI
+streamlit>=1.30.0
+streamlit-agraph>=0.0.45
+
+# Utilities
+python-dotenv>=1.0.0
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
+
+# Testing
+pytest>=7.0.0
+pytest-asyncio>=0.21.0
