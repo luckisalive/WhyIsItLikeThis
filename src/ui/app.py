@@ -5,7 +5,7 @@ Provides an interactive chat interface, knowledge graph neighborhood explorer, a
 
 import logging
 import streamlit as st
-from config import get_settings
+from settings import get_settings
 from src.graph.embedding_generator import EmbeddingGenerator
 from src.graph.neo4j_manager import Neo4jManager
 from src.models import Confidence

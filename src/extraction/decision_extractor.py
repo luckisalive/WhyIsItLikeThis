@@ -1,5 +1,5 @@
 """
-Architectural decision extractor powered by Groq (Llama 3.1 70B) with rule-based fallback.
+Architectural decision extractor powered by Groq (openai/gpt-oss-120b) with rule-based fallback.
 Parses PR discussions, commit messages, and issues to extract structured ArchitecturalDecisionRecord models.
 """
 
@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 
 class DecisionExtractor:
-    """Uses Groq Llama 3.1 70B to extract structured architectural decisions from development history."""
+    """Uses Groq openai/gpt-oss-120b to extract structured architectural decisions from development history."""
 
     SYSTEM_PROMPT = """
 You are an expert Software Architect analyzing Git development history.
@@ -55,7 +55,7 @@ Rules:
 }
 """
 
-    def __init__(self, api_key: str, model: str = "llama-3.1-70b-versatile"):
+    def __init__(self, api_key: str, model: str = "openai/gpt-oss-120b"):
         self.api_key = api_key
         self.model = model
         self._is_placeholder = not api_key or api_key in ("GROQ_API_KEY", "YOUR_GROQ_API_KEY")
@@ -63,6 +63,7 @@ Rules:
         if not self._is_placeholder:
             try:
                 self.client = Groq(api_key=api_key)
+                logger.info(f"Initialized Groq client with model: {model}")
             except Exception as e:
                 logger.warning(f"Could not initialize Groq client: {e}")
 
@@ -83,6 +84,7 @@ Rules:
                             {"role": "user", "content": f"Context for {source_type} {source_id}:\n{text}"},
                         ],
                         response_format={"type": "json_object"},
+                        max_tokens=4096,  # Generous headroom for reasoning tokens + JSON content
                         temperature=0.1,
                     )
                     content = response.choices[0].message.content or ""

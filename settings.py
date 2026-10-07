@@ -1,6 +1,6 @@
 """
-Central configuration management using Pydantic Settings.
-Loads from .env file automatically.
+Central application settings using Pydantic Settings.
+Loads configuration from environment variables and .env file.
 """
 
 from pydantic_settings import BaseSettings
@@ -36,23 +36,23 @@ class Settings(BaseSettings):
     max_issues: int = Field(default=200, description="Max issues to ingest")
     batch_size: int = Field(default=10, description="LLM extraction batch size")
 
-    # Embedding
+    # Embedding (Gemini Embedding 2 at 768 dimensions)
     embedding_model: str = Field(
-        default="models/text-embedding-004",
-        description="Gemini embedding model name",
+        default="gemini-embedding-2",
+        description="Gemini embedding model name (e.g. gemini-embedding-2)",
     )
     embedding_dimensions: int = Field(default=768, description="Embedding vector dimensions")
 
-    # Groq model
+    # Groq extraction model
     groq_model: str = Field(
-        default="llama-3.1-70b-versatile",
-        description="Groq model for decision extraction",
+        default="openai/gpt-oss-120b",
+        description="Groq model for decision extraction (openai/gpt-oss-120b)",
     )
 
-    # Gemini model
+    # Gemini reasoning model
     gemini_model: str = Field(
-        default="gemini-2.0-flash",
-        description="Gemini model for final reasoning",
+        default="gemini-3.5-flash-lite",
+        description="Gemini model for final reasoning (gemini-3.5-flash-lite)",
     )
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}

@@ -32,11 +32,12 @@ class GitHubFetcher:
     def _check_rate_limit(self):
         """Check remaining quota and auto-sleep if approaching limit."""
         try:
-            core_rate = self.gh.get_rate_limit().core
-            if core_rate.remaining < 50:
-                sleep_time = (core_rate.reset.timestamp() - time.time()) + 5
+            rl = self.gh.get_rate_limit()
+            rate_obj = getattr(rl, "rate", getattr(rl, "core", None))
+            if rate_obj and rate_obj.remaining < 50:
+                sleep_time = (rate_obj.reset.timestamp() - time.time()) + 5
                 if sleep_time > 0:
-                    logger.warning(f"Rate limit approaching. Sleeping for {sleep_time:.2f} seconds...")
+                    logger.warning(f"Rate limit approaching ({rate_obj.remaining}/{rate_obj.limit}). Sleeping for {sleep_time:.2f} seconds...")
                     time.sleep(sleep_time)
         except Exception as e:
             logger.error(f"Error checking rate limit: {e}")

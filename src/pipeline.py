@@ -7,7 +7,7 @@ import logging
 import time
 from typing import Optional, Callable
 
-from config import Settings
+from settings import Settings
 from src.ingestion.github_fetcher import GitHubFetcher
 from src.ingestion.cache import SQLiteCache
 from src.extraction.context_collator import ContextCollator

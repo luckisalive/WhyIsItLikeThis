@@ -15,12 +15,22 @@ import asyncio
 import logging
 import sys
 
+# Ensure UTF-8 output on Windows consoles to prevent UnicodeEncodeError with emojis
+if sys.platform == "win32":
+    try:
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        if hasattr(sys.stderr, "reconfigure"):
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 from dotenv import load_dotenv
 
-# Load .env before importing config
+# Load .env before importing settings
 load_dotenv()
 
-from config import get_settings
+from settings import get_settings
 
 logging.basicConfig(
     level=logging.INFO,
@@ -177,12 +187,16 @@ def cmd_check_rate_limit(args):
     from github import Github, Auth
 
     g = Github(auth=Auth.Token(settings.github_token))
-    rate = g.get_rate_limit()
+    rl = g.get_rate_limit()
+    rate = getattr(rl, "rate", getattr(rl, "core", None))
+    search_rate = getattr(rl, "search", None)
     print("\n🔑 GitHub API Rate Limit Status")
     print("=" * 40)
-    print(f"  Core:   {rate.core.remaining} / {rate.core.limit}")
-    print(f"  Search: {rate.search.remaining} / {rate.search.limit}")
-    print(f"  Resets: {rate.core.reset.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+    if rate:
+        print(f"  Core:   {rate.remaining} / {rate.limit}")
+        print(f"  Resets: {rate.reset.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+    if search_rate:
+        print(f"  Search: {search_rate.remaining} / {search_rate.limit}")
     print("=" * 40)
     g.close()
 

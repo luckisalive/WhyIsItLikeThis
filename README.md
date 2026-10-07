@@ -57,9 +57,10 @@ streamlit run src/ui/app.py
 | Component | Technology | Purpose |
 |-----------|-----------|---------|
 | Graph Database | Neo4j AuraDB | Knowledge graph storage with vector search |
-| Extraction LLM | Groq (Llama 3.1 70B) | Fast decision extraction from PR discussions |
-| Reasoning LLM | Google Gemini 2.0 Flash | Evidence-based answer generation |
-| Code Parsing | tree-sitter | Extract functions, classes, config keys |
+| Extraction LLM | Groq (openai/gpt-oss-120b) | High-reasoning decision extraction from PR discussions |
+| Reasoning LLM | Google Gemini 3.5 Flash-Lite | Fast, evidence-grounded answer generation |
+| Embeddings | Gemini Embedding 2 (768d) | 768-dimensional multimodal/text semantic embeddings |
+| Code Parsing | tree-sitter / AST | Extract functions, classes, config keys |
 | Data Source | GitHub API (PyGithub) | Commits, PRs, issues, design docs |
 | Frontend | Streamlit | Interactive dashboard |
 | Caching | SQLite | Local GitHub API response cache |
@@ -67,7 +68,7 @@ streamlit run src/ui/app.py
 ## 📁 Project Structure
 
 ```
-├── config.py               # Pydantic settings
+├── settings.py             # Pydantic application settings
 ├── main.py                 # CLI entry point
 ├── src/
 │   ├── models.py           # Shared data models

@@ -373,15 +373,15 @@ class Neo4jManager:
     def get_stats(self) -> GraphStats:
         """Counts all node types and relationships in the knowledge graph."""
         query = """
-        CALL { MATCH (d:Decision) RETURN count(d) AS dec_total }
-        CALL { MATCH (d:Decision {status: 'ACTIVE'}) RETURN count(d) AS dec_active }
-        CALL { MATCH (d:Decision {status: 'SUPERSEDED'}) RETURN count(d) AS dec_super }
-        CALL { MATCH (c:Commit) RETURN count(c) AS com_total }
-        CALL { MATCH (pr:PullRequest) RETURN count(pr) AS pr_total }
-        CALL { MATCH (i:Issue) RETURN count(i) AS iss_total }
-        CALL { MATCH (p:Person) RETURN count(p) AS per_total }
-        CALL { MATCH (e:CodeEntity) RETURN count(e) AS ent_total }
-        CALL { MATCH ()-[r]->() RETURN count(r) AS rel_total }
+        CALL () { MATCH (d:Decision) RETURN count(d) AS dec_total }
+        CALL () { MATCH (d:Decision {status: 'ACTIVE'}) RETURN count(d) AS dec_active }
+        CALL () { MATCH (d:Decision {status: 'SUPERSEDED'}) RETURN count(d) AS dec_super }
+        CALL () { MATCH (c:Commit) RETURN count(c) AS com_total }
+        CALL () { MATCH (pr:PullRequest) RETURN count(pr) AS pr_total }
+        CALL () { MATCH (i:Issue) RETURN count(i) AS iss_total }
+        CALL () { MATCH (p:Person) RETURN count(p) AS per_total }
+        CALL () { MATCH (e:CodeEntity) RETURN count(e) AS ent_total }
+        CALL () { MATCH ()-[r]->() RETURN count(r) AS rel_total }
         RETURN dec_total, dec_active, dec_super, com_total, pr_total, iss_total, per_total, ent_total, rel_total
         """
         try:
