@@ -28,8 +28,22 @@ class IngestionPipeline:
         self.cache = SQLiteCache()
         self.fetcher = GitHubFetcher(settings.github_token, settings.target_repo, self.cache)
         self.collator = ContextCollator()
-        # Decision extraction powered by Google Gemini (gemini-3.5-flash-lite)
-        self.decision_extractor = DecisionExtractor(settings.google_api_key, settings.gemini_model)
+        # Decision extraction powered by Google Gemini with multi-model cascade and Groq fallback
+        gemini_fallbacks = [
+            m.strip() for m in settings.gemini_fallback_models.split(",") if m.strip()
+        ]
+        groq_fallbacks = [
+            m.strip() for m in settings.groq_fallback_models.split(",") if m.strip()
+        ]
+        self.decision_extractor = DecisionExtractor(
+            api_key=settings.google_api_key,
+            model=settings.gemini_model,
+            fallback_models=gemini_fallbacks,
+            groq_api_key=settings.groq_api_key,
+            groq_fallback_models=groq_fallbacks,
+            enable_cross_provider_fallback=settings.enable_cross_provider_fallback,
+        )
+
         self.entity_extractor = CodeEntityExtractor()
         self.neo4j_mgr = Neo4jManager(settings.neo4j_uri, settings.neo4j_username, settings.neo4j_password)
         self.embedding_gen = EmbeddingGenerator(

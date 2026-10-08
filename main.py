@@ -112,7 +112,18 @@ def cmd_query(args):
         settings.google_api_key, settings.embedding_model, settings.embedding_dimensions
     )
     retriever = WhyRetriever(neo4j_mgr, embedding_gen)
-    engine = AnswerEngine(settings.groq_api_key, settings.groq_model, retriever)
+    groq_fallbacks = [m.strip() for m in settings.groq_fallback_models.split(",") if m.strip()]
+    gemini_reasoning = [m.strip() for m in settings.gemini_fallback_models.split(",") if m.strip()]
+    engine = AnswerEngine(
+        api_key=settings.groq_api_key,
+        model=settings.groq_model,
+        retriever=retriever,
+        fallback_models=groq_fallbacks,
+        google_api_key=settings.google_api_key,
+        gemini_reasoning_models=gemini_reasoning,
+        enable_cross_provider_fallback=settings.enable_cross_provider_fallback,
+    )
+
 
     try:
         logger.info("🔍 Searching for: %s", question)

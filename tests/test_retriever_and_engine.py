@@ -80,3 +80,70 @@ def test_answer_engine_insufficient_evidence():
 
     assert ans.confidence == Confidence.LOW
     assert "don't have enough evidence" in ans.answer_text.lower()
+
+
+def test_answer_engine_groq_cascade_on_rate_limit():
+    mock_retriever = MagicMock()
+    mock_retriever.retrieve.return_value = [{"decision": {"id": "DEC-1", "title": "ASGI Support"}}]
+    mock_retriever.format_context.return_value = "Mock context"
+
+    engine = AnswerEngine(
+        api_key="TEST_GROQ_KEY",
+        model="openai/gpt-oss-120b",
+        retriever=mock_retriever,
+        fallback_models=["openai/gpt-oss-20b"],
+    )
+    assert engine.models == ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]
+    assert engine.active_model_idx == 0
+
+    mock_client = MagicMock()
+
+    def mock_create(**kwargs):
+        model = kwargs.get("model")
+        if model == "openai/gpt-oss-120b":
+            raise Exception("429 Rate limit reached: TPM/RPD exceeded")
+        mock_msg = MagicMock()
+        mock_msg.content = '{"answer_text": "Answer from gpt-oss-20b", "confidence": "HIGH", "confidence_explanation": "Valid", "evidence": []}'
+        return MagicMock(choices=[MagicMock(message=mock_msg)])
+
+    mock_client.chat.completions.create.side_effect = mock_create
+    engine.client = mock_client
+
+    ans = engine.answer("Why ASGI?")
+    assert "Answer from gpt-oss-20b" in ans.answer_text
+    assert engine.active_model_idx == 1
+    assert engine.current_model == "openai/gpt-oss-20b"
+
+
+def test_answer_engine_gemini_cross_provider_fallback():
+    mock_retriever = MagicMock()
+    mock_retriever.retrieve.return_value = [{"decision": {"id": "DEC-1", "title": "Starlette Base"}}]
+    mock_retriever.format_context.return_value = "Mock context"
+
+    engine = AnswerEngine(
+        api_key="TEST_GROQ_KEY",
+        model="openai/gpt-oss-120b",
+        retriever=mock_retriever,
+        fallback_models=["openai/gpt-oss-20b"],
+        google_api_key="TEST_GOOGLE_KEY",
+        gemini_reasoning_models=["gemini-3.7-flash"],
+        enable_cross_provider_fallback=True,
+    )
+
+    # Groq fails completely
+    mock_groq = MagicMock()
+    mock_groq.chat.completions.create.side_effect = Exception("429 Quota exhausted")
+    engine.client = mock_groq
+
+    # Gemini succeeds
+    mock_gemini = MagicMock()
+    mock_resp = MagicMock()
+    mock_resp.text = '{"answer_text": "Answer from Gemini 3.7 Flash reasoning", "confidence": "HIGH", "confidence_explanation": "Direct", "evidence": []}'
+    mock_gemini.models.generate_content.return_value = mock_resp
+    engine.gemini_client = mock_gemini
+
+    ans = engine.answer("Why Starlette?")
+    assert "Answer from Gemini 3.7 Flash reasoning" in ans.answer_text
+    assert ans.confidence == Confidence.HIGH
+    mock_gemini.models.generate_content.assert_called_once()
+

@@ -92,10 +92,21 @@ def main():
             settings.google_api_key, settings.embedding_model, settings.embedding_dimensions
         )
         retriever = WhyRetriever(neo4j_mgr, embedding_gen)
-        # Answering powered by Groq openai/gpt-oss-120b
-        answer_engine = AnswerEngine(settings.groq_api_key, settings.groq_model, retriever)
+        # Answering powered by Groq with multi-model cascade and Gemini fallback
+        groq_fallbacks = [m.strip() for m in settings.groq_fallback_models.split(",") if m.strip()]
+        gemini_reasoning = [m.strip() for m in settings.gemini_fallback_models.split(",") if m.strip()]
+        answer_engine = AnswerEngine(
+            api_key=settings.groq_api_key,
+            model=settings.groq_model,
+            retriever=retriever,
+            fallback_models=groq_fallbacks,
+            google_api_key=settings.google_api_key,
+            gemini_reasoning_models=gemini_reasoning,
+            enable_cross_provider_fallback=settings.enable_cross_provider_fallback,
+        )
     else:
         answer_engine = None
+
 
     # Main Tabs
     tab1, tab2, tab3 = st.tabs(["💬 Ask Why", "🕸️ Knowledge Graph Explorer", "📅 Decision Timeline"])

@@ -61,22 +61,71 @@ Strict Rules:
         api_key: str,
         model: str = "openai/gpt-oss-120b",
         retriever: Optional[WhyRetriever] = None,
+        fallback_models: Optional[List[str]] = None,
+        google_api_key: Optional[str] = None,
+        gemini_reasoning_models: Optional[List[str]] = None,
+        enable_cross_provider_fallback: bool = True,
     ):
         self.api_key = api_key
-        self.model_name = model
         self.retriever = retriever
         self._is_placeholder = not api_key or api_key in ("GROQ_API_KEY", "YOUR_GROQ_API_KEY")
+
+        # Groq model cascade
+        self.models: List[str] = [model]
+        if fallback_models:
+            for m in fallback_models:
+                m_clean = m.strip()
+                if m_clean and m_clean not in self.models:
+                    self.models.append(m_clean)
+        self.active_model_idx: int = 0
 
         self.client: Optional[Groq] = None
         if not self._is_placeholder:
             try:
                 self.client = Groq(api_key=api_key)
-                logger.info(f"Initialized Groq client for answering with model: {model}")
+                logger.info(f"Initialized Groq client with model cascade: {self.models}")
             except Exception as e:
                 logger.warning(f"Could not initialize Groq client: {e}")
 
+        # Google Gemini cross-provider fallback
+        self.enable_cross_provider_fallback = enable_cross_provider_fallback
+        self.gemini_client: Optional[Any] = None
+        self.gemini_models: List[str] = [
+            "gemini-3.7-flash",
+            "gemini-3.6-flash",
+            "gemini-3-flash",
+            "gemini-2.5-flash",
+        ]
+        if gemini_reasoning_models:
+            cleaned_gm = [
+                m.strip().lower().replace(" ", "-")
+                for m in gemini_reasoning_models
+                if m.strip()
+            ]
+            if cleaned_gm:
+                self.gemini_models = cleaned_gm
+
+        if (
+            enable_cross_provider_fallback
+            and google_api_key
+            and google_api_key not in ("GOOGLE_API_KEY", "YOUR_GOOGLE_API_KEY")
+        ):
+            try:
+                from google import genai
+                self.gemini_client = genai.Client(api_key=google_api_key)
+                logger.info(f"Initialized Gemini reasoning fallback client with models: {self.gemini_models}")
+            except Exception as e:
+                logger.debug(f"Gemini fallback client initialization note: {e}")
+
+    @property
+    def current_model(self) -> str:
+        """Returns the currently active Groq model."""
+        if self.active_model_idx < len(self.models):
+            return self.models[self.active_model_idx]
+        return self.models[-1]
+
     def answer(self, question: str) -> Answer:
-        """Generates an evidence-grounded answer to a 'why' question."""
+        """Generates an evidence-grounded answer to a 'why' question with automatic failover."""
         if not self.retriever:
             logger.error("Retriever is not configured.")
             return self._build_insufficient_evidence_answer(question)
@@ -93,23 +142,70 @@ Strict Rules:
 
         prompt = f"QUESTION: {question}\n\nKNOWLEDGE GRAPH CONTEXT:\n{context}\n\nProvide the required JSON response:"
 
-        try:
-            response = self.client.chat.completions.create(
-                model=self.model_name,
-                messages=[
-                    {"role": "system", "content": self.SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt},
-                ],
-                response_format={"type": "json_object"},
-                max_tokens=4096,  # Generous headroom for reasoning tokens + JSON response
-                temperature=0.1,
-            )
-            response_text = response.choices[0].message.content or ""
-            return self._parse_response(response_text, results, question)
+        # 1. Try Groq model cascade
+        while self.active_model_idx < len(self.models):
+            curr_model = self.models[self.active_model_idx]
+            try:
+                response = self.client.chat.completions.create(
+                    model=curr_model,
+                    messages=[
+                        {"role": "system", "content": self.SYSTEM_PROMPT},
+                        {"role": "user", "content": prompt},
+                    ],
+                    response_format={"type": "json_object"},
+                    max_tokens=4096,
+                    temperature=0.1,
+                )
+                response_text = response.choices[0].message.content or ""
+                return self._parse_response(response_text, results, question)
 
-        except Exception as e:
-            logger.warning(f"Groq API call failed: {e}. Falling back to graph evidence synthesis.")
-            return self._build_heuristic_answer(question, results, context)
+            except Exception as e:
+                err_msg = str(e).lower()
+                is_rate = "429" in err_msg or "rate limit" in err_msg or "rate_limit_exceeded" in err_msg
+                is_quota = "quota" in err_msg or "tokens per day" in err_msg
+
+                if is_rate or is_quota:
+                    logger.warning(
+                        f"Groq rate limit reached for model '{curr_model}'. "
+                        f"Switching to next model in cascade."
+                    )
+                    self.active_model_idx += 1
+                    if self.active_model_idx < len(self.models):
+                        logger.info(f"Active Groq model is now: '{self.models[self.active_model_idx]}'")
+                        continue
+                    else:
+                        logger.warning("All Groq models exhausted.")
+                        break
+                else:
+                    logger.warning(f"Groq API call ({curr_model}) failed: {e}")
+                    break
+
+        # 2. Try Google Gemini cross-provider reasoning fallback
+        if self.enable_cross_provider_fallback and self.gemini_client:
+            from google.genai import types
+            for g_model in self.gemini_models:
+                try:
+                    logger.info(f"Attempting Gemini reasoning fallback with model: '{g_model}'")
+                    config = types.GenerateContentConfig(
+                        temperature=0.1,
+                        response_mime_type="application/json",
+                        system_instruction=self.SYSTEM_PROMPT,
+                    )
+                    resp = self.gemini_client.models.generate_content(
+                        model=g_model,
+                        contents=prompt,
+                        config=config,
+                    )
+                    response_text = resp.text or ""
+                    if response_text:
+                        return self._parse_response(response_text, results, question)
+                except Exception as gem_e:
+                    logger.warning(f"Gemini reasoning fallback with '{g_model}' failed: {gem_e}")
+
+        # 3. Fallback to graph traversal heuristic synthesis
+        logger.info("Falling back to direct graph context synthesis.")
+        return self._build_heuristic_answer(question, results, context)
+
 
     def _build_insufficient_evidence_answer(self, question: str) -> Answer:
         """Default response when no evidence exists in the graph."""

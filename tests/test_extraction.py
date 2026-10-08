@@ -67,3 +67,71 @@ def test_decision_extractor_heuristic():
     assert decision is not None
     assert "Starlette" in decision.title
     assert decision.confidence_score >= 0.5
+
+
+def test_decision_extractor_model_cascade_on_quota():
+    from unittest.mock import MagicMock
+    extractor = DecisionExtractor(
+        api_key="TEST_REAL_KEY_123",
+        model="gemini-3.1-flash-lite",
+        fallback_models=["gemini-2.5-flash-lite", "gemini-2.5-flash"],
+    )
+    assert extractor.models == ["gemini-3.1-flash-lite", "gemini-2.5-flash-lite", "gemini-2.5-flash"]
+    assert extractor.active_model_idx == 0
+
+    # Mock client to simulate 429 quota exhaustion on first model and success on second
+    mock_client = MagicMock()
+    mock_resp = MagicMock()
+    mock_resp.text = '{"title": "Switch to Starlette", "type": "ARCHITECTURE", "problem_context": "c", "decision_made": "d", "rationale": "r", "confidence_score": 0.9}'
+
+    def mock_generate_content(model, contents, config):
+        if model == "gemini-3.1-flash-lite":
+            raise Exception("429 RESOURCE_EXHAUSTED: Daily quota exceeded for Queries per day")
+        return mock_resp
+
+    mock_client.models.generate_content.side_effect = mock_generate_content
+    extractor.client = mock_client
+
+    text = "PR Title: We decided to switch to Starlette for async performance\nWe chose Starlette over Werkzeug."
+    decision = extractor.extract_from_text(text, "pull_request", "1")
+
+    assert decision is not None
+    assert decision.title == "Switch to Starlette"
+    # Verify active model advanced sticky to index 1 (gemini-2.5-flash-lite)
+    assert extractor.active_model_idx == 1
+    assert extractor.current_model == "gemini-2.5-flash-lite"
+
+
+def test_decision_extractor_groq_cross_provider_fallback():
+    from unittest.mock import MagicMock
+    extractor = DecisionExtractor(
+        api_key="TEST_REAL_KEY_123",
+        model="gemini-3.1-flash-lite",
+        fallback_models=["gemini-2.5-flash-lite"],
+        groq_api_key="TEST_GROQ_KEY",
+        groq_fallback_models=["openai/gpt-oss-20b"],
+        enable_cross_provider_fallback=True,
+    )
+
+    # Mock Gemini client to always fail with quota exhaustion
+    mock_client = MagicMock()
+    mock_client.models.generate_content.side_effect = Exception("429 Daily quota reached")
+    extractor.client = mock_client
+
+    # Mock Groq client to succeed
+    mock_groq = MagicMock()
+    mock_groq_resp = MagicMock()
+    mock_msg = MagicMock()
+    mock_msg.content = '{"title": "Adopt Pydantic", "type": "ARCHITECTURE", "problem_context": "c", "decision_made": "d", "rationale": "r", "confidence_score": 0.85}'
+    mock_groq_resp.choices = [MagicMock(message=mock_msg)]
+    mock_groq.chat.completions.create.return_value = mock_groq_resp
+    extractor.groq_client = mock_groq
+
+    text = "PR Title: We decided to adopt Pydantic for validation\nDiscussion on schemas."
+    decision = extractor.extract_from_text(text, "pull_request", "2")
+
+    assert decision is not None
+    assert decision.title == "Adopt Pydantic"
+    assert extractor.active_model_idx >= len(extractor.models)
+    mock_groq.chat.completions.create.assert_called_once()
+

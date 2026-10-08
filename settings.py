@@ -48,14 +48,29 @@ class Settings(BaseSettings):
         default="openai/gpt-oss-120b",
         description="Groq model for final reasoning and query answering (openai/gpt-oss-120b)",
     )
+    groq_fallback_models: str = Field(
+        default="openai/gpt-oss-20b",
+        description="Comma-separated Groq fallback models (e.g. openai/gpt-oss-20b)",
+    )
 
     # Gemini extraction model
     gemini_model: str = Field(
-        default="gemini-3.5-flash-lite",
-        description="Gemini model for decision extraction (gemini-3.5-flash-lite)",
+        default="gemini-3.1-flash-lite",
+        description="Primary Gemini model for decision extraction (gemini-3.1-flash-lite)",
+    )
+    gemini_fallback_models: str = Field(
+        default="gemini-2.5-flash-lite,gemini-2.5-flash,gemini-3-flash,gemini-3.6-flash,gemini-3.7-flash,gemini-3.8-flash",
+        description="Comma-separated list of Gemini models to cascade through upon reaching daily rate limits",
+    )
+
+    # Cross-provider fallback
+    enable_cross_provider_fallback: bool = Field(
+        default=True,
+        description="Enable cross-provider failover (Gemini -> Groq or Groq -> Gemini) when rate limits are exhausted",
     )
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
+
 
 
 def get_settings() -> Settings:
