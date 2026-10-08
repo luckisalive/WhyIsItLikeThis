@@ -74,13 +74,16 @@ Rules:
     def __init__(
         self,
         api_key: str,
-        model: str = "gemini-3.1-flash-lite",
+        model: str = "gemini-3.5-flash-lite",
         fallback_models: Optional[List[str]] = None,
         groq_api_key: Optional[str] = None,
         groq_fallback_models: Optional[List[str]] = None,
         enable_cross_provider_fallback: bool = True,
+        cooldown_seconds: int = 60,
     ):
         self.api_key = api_key
+        self.cooldown_seconds = cooldown_seconds
+        self.all_models_exhausted: bool = False
         self._is_placeholder = not api_key or api_key in ("GOOGLE_API_KEY", "YOUR_GOOGLE_API_KEY")
 
         # Build prioritized Gemini model list
@@ -120,11 +123,12 @@ Rules:
 
         # Cross-provider Groq fallback setup
         self.enable_cross_provider_fallback = enable_cross_provider_fallback
-        self.groq_models: List[str] = ["openai/gpt-oss-20b", "openai/gpt-oss-120b"]
+        self.groq_models: List[str] = ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]
         if groq_fallback_models:
             cleaned_g = [m.strip() for m in groq_fallback_models if m.strip()]
             if cleaned_g:
                 self.groq_models = cleaned_g
+        self.active_groq_idx: int = 0
         self.groq_client: Optional[Any] = None
 
         if (
@@ -152,7 +156,7 @@ Rules:
             return None
 
         if not self._is_placeholder:
-            # 1. Cascade through configured Gemini models
+            # 1. Cascade through configured Gemini models (Primary + Fallbacks)
             while self.active_model_idx < len(self.models):
                 curr_model = self.models[self.active_model_idx]
                 retries = 2
@@ -233,9 +237,10 @@ Rules:
 
             # 2. Cross-provider fallback to Groq if all Gemini models are exhausted
             if self.enable_cross_provider_fallback and self.groq_client:
-                for g_model in self.groq_models:
+                while self.active_groq_idx < len(self.groq_models):
+                    g_model = self.groq_models[self.active_groq_idx]
                     try:
-                        logger.info(f"Cross-provider fallback: attempting extraction with Groq '{g_model}'")
+                        logger.info(f"All Gemini models exhausted. Falling back to Groq model '{g_model}' for extraction.")
                         prompt = f"Context for {source_type} #{source_id}:\n\n{text}"
                         resp = self.groq_client.chat.completions.create(
                             model=g_model,
@@ -259,10 +264,31 @@ Rules:
 
                         return ExtractedDecision.model_validate(data)
                     except Exception as g_err:
-                        logger.warning(f"Groq extraction fallback with '{g_model}' failed: {g_err}")
+                        g_msg = str(g_err).lower()
+                        is_groq_rate = "429" in g_msg or "rate limit" in g_msg or "quota" in g_msg
+                        if is_groq_rate:
+                            logger.warning(f"Groq model '{g_model}' rate limited. Advancing to next Groq fallback.")
+                            self.active_groq_idx += 1
+                        else:
+                            logger.warning(f"Groq extraction fallback with '{g_model}' failed: {g_err}")
+                            break
 
-        # 3. Deterministic rule-based heuristic extractor fallback
+            # 3. If ALL models (all Gemini + all Groq) are exhausted, enforce rate limit cooldown!
+            all_gemini_exhausted = self.active_model_idx >= len(self.models)
+            all_groq_exhausted = not self.groq_client or self.active_groq_idx >= len(self.groq_models)
+
+            if all_gemini_exhausted and all_groq_exhausted:
+                self.all_models_exhausted = True
+                logger.warning(
+                    f"🚨 ALL models across Google Gemini ({len(self.models)} models) and Groq ({len(self.groq_models)} models) "
+                    f"are exhausted due to rate limits! Enforcing rate limit cool-down of {self.cooldown_seconds}s."
+                )
+                if self.cooldown_seconds > 0:
+                    time.sleep(self.cooldown_seconds)
+
+        # 4. Deterministic rule-based heuristic extractor fallback
         return self._heuristic_extract(text, source_type, source_id)
+
 
 
     def extract_from_pr(self, pr: PRData, collator: ContextCollator) -> Optional[ExtractedDecision]:

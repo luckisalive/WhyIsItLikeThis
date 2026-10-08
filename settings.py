@@ -55,11 +55,11 @@ class Settings(BaseSettings):
 
     # Gemini extraction model
     gemini_model: str = Field(
-        default="gemini-3.1-flash-lite",
-        description="Primary Gemini model for decision extraction (gemini-3.1-flash-lite)",
+        default="gemini-3.5-flash-lite",
+        description="Primary Gemini model for decision extraction (gemini-3.5-flash-lite)",
     )
     gemini_fallback_models: str = Field(
-        default="gemini-2.5-flash-lite,gemini-2.5-flash,gemini-3-flash,gemini-3.6-flash,gemini-3.7-flash,gemini-3.8-flash",
+        default="gemini-3.1-flash-lite,gemini-2.5-flash-lite,gemini-2.5-flash,gemini-3-flash,gemini-3.6-flash,gemini-3.7-flash,gemini-3.8-flash",
         description="Comma-separated list of Gemini models to cascade through upon reaching daily rate limits",
     )
 
@@ -69,7 +69,14 @@ class Settings(BaseSettings):
         description="Enable cross-provider failover (Gemini -> Groq or Groq -> Gemini) when rate limits are exhausted",
     )
 
+    # Global rate limit cooldown when all models are exhausted
+    rate_limit_cooldown_seconds: int = Field(
+        default=60,
+        description="Cooldown wait time in seconds if all models across both providers are exhausted",
+    )
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
+
 
 
 

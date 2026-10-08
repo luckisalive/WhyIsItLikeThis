@@ -122,7 +122,9 @@ def cmd_query(args):
         google_api_key=settings.google_api_key,
         gemini_reasoning_models=gemini_reasoning,
         enable_cross_provider_fallback=settings.enable_cross_provider_fallback,
+        cooldown_seconds=settings.rate_limit_cooldown_seconds,
     )
+
 
 
     try:

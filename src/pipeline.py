@@ -42,7 +42,9 @@ class IngestionPipeline:
             groq_api_key=settings.groq_api_key,
             groq_fallback_models=groq_fallbacks,
             enable_cross_provider_fallback=settings.enable_cross_provider_fallback,
+            cooldown_seconds=settings.rate_limit_cooldown_seconds,
         )
+
 
         self.entity_extractor = CodeEntityExtractor()
         self.neo4j_mgr = Neo4jManager(settings.neo4j_uri, settings.neo4j_username, settings.neo4j_password)

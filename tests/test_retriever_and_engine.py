@@ -147,3 +147,37 @@ def test_answer_engine_gemini_cross_provider_fallback():
     assert ans.confidence == Confidence.HIGH
     mock_gemini.models.generate_content.assert_called_once()
 
+
+def test_answer_engine_all_models_exhaustion_cooldown():
+    mock_retriever = MagicMock()
+    mock_retriever.retrieve.return_value = [{"decision": {"id": "DEC-1", "title": "Starlette Base"}}]
+    mock_retriever.format_context.return_value = "Mock context"
+
+    engine = AnswerEngine(
+        api_key="TEST_GROQ_KEY",
+        model="openai/gpt-oss-120b",
+        retriever=mock_retriever,
+        fallback_models=["openai/gpt-oss-20b"],
+        google_api_key="TEST_GOOGLE_KEY",
+        gemini_reasoning_models=["gemini-3.5-flash-lite"],
+        enable_cross_provider_fallback=True,
+        cooldown_seconds=0,
+    )
+
+    # Groq fails
+    mock_groq = MagicMock()
+    mock_groq.chat.completions.create.side_effect = Exception("429 Quota exhausted")
+    engine.client = mock_groq
+
+    # Gemini fails too
+    mock_gemini = MagicMock()
+    mock_gemini.models.generate_content.side_effect = Exception("429 Resource exhausted")
+    engine.gemini_client = mock_gemini
+
+    ans = engine.answer("Why Starlette?")
+    assert engine.all_models_exhausted is True
+    # Graceful answer from graph
+    assert "Starlette" in ans.answer_text
+    assert "throttled" in ans.confidence_explanation.lower()
+
+

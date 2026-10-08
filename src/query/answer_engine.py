@@ -65,7 +65,9 @@ Strict Rules:
         google_api_key: Optional[str] = None,
         gemini_reasoning_models: Optional[List[str]] = None,
         enable_cross_provider_fallback: bool = True,
+        cooldown_seconds: int = 60,
     ):
+
         self.api_key = api_key
         self.retriever = retriever
         self._is_placeholder = not api_key or api_key in ("GROQ_API_KEY", "YOUR_GROQ_API_KEY")
@@ -89,12 +91,17 @@ Strict Rules:
 
         # Google Gemini cross-provider fallback
         self.enable_cross_provider_fallback = enable_cross_provider_fallback
+        self.cooldown_seconds = cooldown_seconds
+        self.all_models_exhausted: bool = False
         self.gemini_client: Optional[Any] = None
         self.gemini_models: List[str] = [
+            "gemini-3.5-flash-lite",
             "gemini-3.7-flash",
             "gemini-3.6-flash",
             "gemini-3-flash",
             "gemini-2.5-flash",
+            "gemini-3.1-flash-lite",
+            "gemini-2.5-flash-lite",
         ]
         if gemini_reasoning_models:
             cleaned_gm = [
@@ -103,7 +110,16 @@ Strict Rules:
                 if m.strip()
             ]
             if cleaned_gm:
-                self.gemini_models = cleaned_gm
+                # Ensure gemini-3.5-flash-lite is first if present
+                ordered_gm = []
+                if "gemini-3.5-flash-lite" in cleaned_gm:
+                    ordered_gm.append("gemini-3.5-flash-lite")
+                for m in cleaned_gm:
+                    if m not in ordered_gm:
+                        ordered_gm.append(m)
+                self.gemini_models = ordered_gm
+
+        self.active_gemini_idx: int = 0
 
         if (
             enable_cross_provider_fallback
@@ -183,7 +199,8 @@ Strict Rules:
         # 2. Try Google Gemini cross-provider reasoning fallback
         if self.enable_cross_provider_fallback and self.gemini_client:
             from google.genai import types
-            for g_model in self.gemini_models:
+            while self.active_gemini_idx < len(self.gemini_models):
+                g_model = self.gemini_models[self.active_gemini_idx]
                 try:
                     logger.info(f"Attempting Gemini reasoning fallback with model: '{g_model}'")
                     config = types.GenerateContentConfig(
@@ -200,11 +217,38 @@ Strict Rules:
                     if response_text:
                         return self._parse_response(response_text, results, question)
                 except Exception as gem_e:
-                    logger.warning(f"Gemini reasoning fallback with '{g_model}' failed: {gem_e}")
+                    gem_msg = str(gem_e).lower()
+                    if "429" in gem_msg or "resource_exhausted" in gem_msg or "quota" in gem_msg:
+                        logger.warning(f"Gemini fallback model '{g_model}' rate limited. Advancing to next Gemini fallback.")
+                        self.active_gemini_idx += 1
+                    else:
+                        logger.warning(f"Gemini reasoning fallback with '{g_model}' failed: {gem_e}")
+                        break
 
-        # 3. Fallback to graph traversal heuristic synthesis
+        # 3. If ALL models (Groq + Gemini) are exhausted, trigger rate limit cooldown!
+        all_groq_exhausted = self.active_model_idx >= len(self.models)
+        all_gemini_exhausted = not self.gemini_client or self.active_gemini_idx >= len(self.gemini_models)
+
+        if all_groq_exhausted and all_gemini_exhausted:
+            self.all_models_exhausted = True
+            logger.warning(
+                f"🚨 ALL models across Groq ({len(self.models)} models) and Google Gemini ({len(self.gemini_models)} models) "
+                f"are exhausted due to rate limits! Enforcing rate limit cool-down of {self.cooldown_seconds}s."
+            )
+            if self.cooldown_seconds > 0:
+                import time
+                time.sleep(self.cooldown_seconds)
+
+        # 4. Fallback to graph traversal heuristic synthesis
         logger.info("Falling back to direct graph context synthesis.")
-        return self._build_heuristic_answer(question, results, context)
+        ans = self._build_heuristic_answer(question, results, context)
+        if self.all_models_exhausted:
+            ans.confidence_explanation = (
+                "Synthesized directly from verified knowledge graph nodes. "
+                "(Notice: All cloud LLMs temporarily throttled by API rate limits)."
+            )
+        return ans
+
 
 
     def _build_insufficient_evidence_answer(self, question: str) -> Answer:
