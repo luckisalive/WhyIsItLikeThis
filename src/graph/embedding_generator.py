@@ -88,7 +88,12 @@ class EmbeddingGenerator:
                         return values
                     elif len(values) > self.dimensions:
                         return values[: self.dimensions]
-                    return values
+                    logger.warning(
+                        "google.genai returned an embedding with %d dimensions; "
+                        "expected %d. Trying fallback.",
+                        len(values),
+                        self.dimensions,
+                    )
             except Exception as e:
                 err_msg = str(e)
                 if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
@@ -111,7 +116,16 @@ class EmbeddingGenerator:
                 )
                 values = result.get("embedding", [])
                 if values:
-                    return values[: self.dimensions]
+                    if len(values) == self.dimensions:
+                        return values
+                    if len(values) > self.dimensions:
+                        return values[: self.dimensions]
+                    logger.warning(
+                        "Legacy genai returned an embedding with %d dimensions; "
+                        "expected %d. Trying fallback.",
+                        len(values),
+                        self.dimensions,
+                    )
             except Exception as e:
                 logger.warning(f"Legacy genai embedding failed: {e}")
 
