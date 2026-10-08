@@ -88,9 +88,12 @@ def main():
 
     # Initialize Retrieval & Answer Engine
     if neo4j_mgr:
-        embedding_gen = EmbeddingGenerator(settings.google_api_key, settings.embedding_model)
+        embedding_gen = EmbeddingGenerator(
+            settings.google_api_key, settings.embedding_model, settings.embedding_dimensions
+        )
         retriever = WhyRetriever(neo4j_mgr, embedding_gen)
-        answer_engine = AnswerEngine(settings.google_api_key, settings.gemini_model, retriever)
+        # Answering powered by Groq openai/gpt-oss-120b
+        answer_engine = AnswerEngine(settings.groq_api_key, settings.groq_model, retriever)
     else:
         answer_engine = None
 

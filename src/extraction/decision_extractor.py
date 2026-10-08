@@ -1,5 +1,5 @@
 """
-Architectural decision extractor powered by Groq (openai/gpt-oss-120b) with rule-based fallback.
+Architectural decision extractor powered by Google Gemini (gemini-3.5-flash-lite) with rule-based fallback.
 Parses PR discussions, commit messages, and issues to extract structured ArchitecturalDecisionRecord models.
 """
 
@@ -7,9 +7,27 @@ import json
 import logging
 import re
 import time
-from typing import List, Optional
+from typing import Any, List, Optional
 
-from groq import Groq
+logger = logging.getLogger(__name__)
+
+# Modern google.genai SDK
+try:
+    from google import genai
+    from google.genai import types
+    HAS_NEW_GENAI = True
+except ImportError:
+    HAS_NEW_GENAI = False
+
+# Legacy fallback
+try:
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", FutureWarning)
+        import google.generativeai as legacy_genai
+    HAS_LEGACY_GENAI = True
+except ImportError:
+    HAS_LEGACY_GENAI = False
 
 from src.extraction.context_collator import ContextCollator
 from src.models import (
@@ -21,11 +39,9 @@ from src.models import (
     PRData,
 )
 
-logger = logging.getLogger(__name__)
-
 
 class DecisionExtractor:
-    """Uses Groq openai/gpt-oss-120b to extract structured architectural decisions from development history."""
+    """Uses Google Gemini (gemini-3.5-flash-lite) to extract structured architectural decisions."""
 
     SYSTEM_PROMPT = """
 You are an expert Software Architect analyzing Git development history.
@@ -55,56 +71,84 @@ Rules:
 }
 """
 
-    def __init__(self, api_key: str, model: str = "openai/gpt-oss-120b"):
+    def __init__(self, api_key: str, model: str = "gemini-3.5-flash-lite"):
         self.api_key = api_key
         self.model = model
-        self._is_placeholder = not api_key or api_key in ("GROQ_API_KEY", "YOUR_GROQ_API_KEY")
-        self.client = None
+        self._is_placeholder = not api_key or api_key in ("GOOGLE_API_KEY", "YOUR_GOOGLE_API_KEY")
+
+        self.client: Optional[Any] = None
+        self.legacy_model: Optional[Any] = None
+
         if not self._is_placeholder:
-            try:
-                self.client = Groq(api_key=api_key)
-                logger.info(f"Initialized Groq client with model: {model}")
-            except Exception as e:
-                logger.warning(f"Could not initialize Groq client: {e}")
+            if HAS_NEW_GENAI:
+                try:
+                    self.client = genai.Client(api_key=api_key)
+                    logger.info(f"Initialized google.genai Client for extraction with model: {model}")
+                except Exception as e:
+                    logger.warning(f"Could not initialize google.genai Client: {e}")
+            elif HAS_LEGACY_GENAI:
+                try:
+                    legacy_genai.configure(api_key=api_key)
+                    self.legacy_model = legacy_genai.GenerativeModel(model_name=model)
+                    logger.info(f"Initialized legacy genai for extraction with model: {model}")
+                except Exception as e:
+                    logger.warning(f"Could not initialize legacy genai: {e}")
 
     def extract_from_text(self, text: str, source_type: str, source_id: str) -> Optional[ExtractedDecision]:
-        """Sends discussion text to Groq LLM with retries, falling back to heuristics if offline."""
+        """Sends discussion text to Gemini with retries and exponential backoff on rate limits."""
         if not text or len(text.strip()) < 30:
             return None
 
-        if self.client and not self._is_placeholder:
+        if not self._is_placeholder:
             retries = 3
-            backoff = 2
+            backoff = 3.0
+
             for attempt in range(retries):
                 try:
-                    response = self.client.chat.completions.create(
-                        model=self.model,
-                        messages=[
-                            {"role": "system", "content": self.SYSTEM_PROMPT},
-                            {"role": "user", "content": f"Context for {source_type} {source_id}:\n{text}"},
-                        ],
-                        response_format={"type": "json_object"},
-                        max_tokens=4096,  # Generous headroom for reasoning tokens + JSON content
-                        temperature=0.1,
-                    )
-                    content = response.choices[0].message.content or ""
-                    clean_content = content.strip()
-                    if clean_content.startswith("```json"):
-                        clean_content = clean_content[7:-3].strip()
-                    elif clean_content.startswith("```"):
-                        clean_content = clean_content[3:-3].strip()
+                    content_str = ""
+                    # 1. Try modern google.genai SDK
+                    if HAS_NEW_GENAI and self.client:
+                        config = types.GenerateContentConfig(
+                            temperature=0.1,
+                            response_mime_type="application/json",
+                            system_instruction=self.SYSTEM_PROMPT,
+                        )
+                        prompt = f"Context for {source_type} #{source_id}:\n\n{text}"
+                        resp = self.client.models.generate_content(
+                            model=self.model,
+                            contents=prompt,
+                            config=config,
+                        )
+                        content_str = resp.text or ""
 
-                    data = json.loads(clean_content)
-                    if data.get("confidence_score", 0.0) < 0.3:
-                        return None
+                    # 2. Try legacy google.generativeai SDK
+                    elif HAS_LEGACY_GENAI and self.legacy_model:
+                        prompt = f"{self.SYSTEM_PROMPT}\n\nContext for {source_type} #{source_id}:\n\n{text}"
+                        resp = self.legacy_model.generate_content(prompt)
+                        content_str = resp.text or ""
 
-                    return ExtractedDecision.model_validate(data)
+                    if content_str:
+                        clean_content = content_str.strip()
+                        if clean_content.startswith("```json"):
+                            clean_content = clean_content[7:-3].strip()
+                        elif clean_content.startswith("```"):
+                            clean_content = clean_content[3:-3].strip()
+
+                        data = json.loads(clean_content)
+                        if data.get("confidence_score", 0.0) < 0.3:
+                            return None
+
+                        return ExtractedDecision.model_validate(data)
 
                 except Exception as e:
-                    logger.debug(f"Groq extraction attempt {attempt + 1} for {source_type} {source_id}: {e}")
-                    if attempt < retries - 1:
+                    err_msg = str(e)
+                    if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
+                        logger.warning(f"Gemini extraction rate limit (429) hit on attempt {attempt + 1}. Sleeping {backoff:.1f}s...")
                         time.sleep(backoff)
                         backoff *= 2
+                    else:
+                        logger.debug(f"Gemini extraction attempt {attempt + 1} for {source_type} {source_id}: {e}")
+                        time.sleep(1.0)
 
         # Fallback heuristic extractor
         return self._heuristic_extract(text, source_type, source_id)

@@ -63,7 +63,7 @@ def test_answer_engine_heuristic_synthesis():
     ]
     mock_retriever.format_context.return_value = "Mock context"
 
-    engine = AnswerEngine(api_key="GOOGLE_API_KEY", retriever=mock_retriever)
+    engine = AnswerEngine(api_key="GROQ_API_KEY", retriever=mock_retriever)
     ans = engine.answer("Why was Pydantic chosen?")
 
     assert ans.confidence in (Confidence.HIGH, Confidence.MEDIUM)
@@ -75,7 +75,7 @@ def test_answer_engine_insufficient_evidence():
     mock_retriever = MagicMock()
     mock_retriever.retrieve.return_value = []
 
-    engine = AnswerEngine(api_key="GOOGLE_API_KEY", retriever=mock_retriever)
+    engine = AnswerEngine(api_key="GROQ_API_KEY", retriever=mock_retriever)
     ans = engine.answer("Why did you build this in COBOL?")
 
     assert ans.confidence == Confidence.LOW

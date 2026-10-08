@@ -43,16 +43,16 @@ class Settings(BaseSettings):
     )
     embedding_dimensions: int = Field(default=768, description="Embedding vector dimensions")
 
-    # Groq extraction model
+    # Groq reasoning / answering model
     groq_model: str = Field(
         default="openai/gpt-oss-120b",
-        description="Groq model for decision extraction (openai/gpt-oss-120b)",
+        description="Groq model for final reasoning and query answering (openai/gpt-oss-120b)",
     )
 
-    # Gemini reasoning model
+    # Gemini extraction model
     gemini_model: str = Field(
         default="gemini-3.5-flash-lite",
-        description="Gemini model for final reasoning (gemini-3.5-flash-lite)",
+        description="Gemini model for decision extraction (gemini-3.5-flash-lite)",
     )
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}

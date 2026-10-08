@@ -1,5 +1,5 @@
 """
-Answer generation engine powered by Gemini 3.5 Flash-Lite and GraphRAG.
+Answer generation engine powered by Groq (openai/gpt-oss-120b) and GraphRAG.
 Synthesizes graph traversal results into structured answers with confidence signals,
 evidence chains, supersession warnings, and recommended points of contact.
 """
@@ -8,33 +8,16 @@ import json
 import logging
 from typing import Any, List, Optional
 
-logger = logging.getLogger(__name__)
-
-# Modern google.genai SDK
-try:
-    from google import genai
-    from google.genai import types
-    HAS_NEW_GENAI = True
-except ImportError:
-    HAS_NEW_GENAI = False
-
-HAS_LEGACY_GENAI = False
-if not HAS_NEW_GENAI:
-    try:
-        import warnings
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", FutureWarning)
-            import google.generativeai as legacy_genai
-        HAS_LEGACY_GENAI = True
-    except ImportError:
-        HAS_LEGACY_GENAI = False
+from groq import Groq
 
 from src.models import Answer, Confidence, EvidenceItem, SupersessionInfo
 from src.query.retriever import WhyRetriever
 
+logger = logging.getLogger(__name__)
+
 
 class AnswerEngine:
-    """Uses Gemini 3.5 Flash-Lite to reason over graph context and generate verifiable answers."""
+    """Uses Groq openai/gpt-oss-120b to reason over graph context and generate verifiable answers."""
 
     SYSTEM_PROMPT = """
 You are a senior software architect and code historian answering 'why is the code like this' questions.
@@ -76,31 +59,21 @@ Strict Rules:
     def __init__(
         self,
         api_key: str,
-        model: str = "gemini-3.5-flash-lite",
+        model: str = "openai/gpt-oss-120b",
         retriever: Optional[WhyRetriever] = None,
     ):
         self.api_key = api_key
         self.model_name = model
         self.retriever = retriever
-        self._is_placeholder = not api_key or api_key in ("GOOGLE_API_KEY", "YOUR_GOOGLE_API_KEY")
+        self._is_placeholder = not api_key or api_key in ("GROQ_API_KEY", "YOUR_GROQ_API_KEY")
 
-        self.client: Optional[Any] = None
-        self.legacy_model: Optional[Any] = None
-
+        self.client: Optional[Groq] = None
         if not self._is_placeholder:
-            if HAS_NEW_GENAI:
-                try:
-                    self.client = genai.Client(api_key=api_key)
-                    logger.info(f"Initialized google.genai Client with model: {model}")
-                except Exception as e:
-                    logger.warning(f"Could not initialize google.genai Client: {e}")
-            elif HAS_LEGACY_GENAI:
-                try:
-                    legacy_genai.configure(api_key=api_key)
-                    self.legacy_model = legacy_genai.GenerativeModel(model_name=model)
-                    logger.info(f"Initialized legacy genai with model: {model}")
-                except Exception as e:
-                    logger.warning(f"Could not initialize legacy genai: {e}")
+            try:
+                self.client = Groq(api_key=api_key)
+                logger.info(f"Initialized Groq client for answering with model: {model}")
+            except Exception as e:
+                logger.warning(f"Could not initialize Groq client: {e}")
 
     def answer(self, question: str) -> Answer:
         """Generates an evidence-grounded answer to a 'why' question."""
@@ -115,34 +88,28 @@ Strict Rules:
 
         context = self.retriever.format_context(results)
 
-        if self._is_placeholder:
+        if self._is_placeholder or not self.client:
             return self._build_heuristic_answer(question, results, context)
 
         prompt = f"QUESTION: {question}\n\nKNOWLEDGE GRAPH CONTEXT:\n{context}\n\nProvide the required JSON response:"
 
-        # 1. Try modern google.genai SDK
-        if HAS_NEW_GENAI and self.client:
-            try:
-                response = self.client.models.generate_content(
-                    model=self.model_name,
-                    contents=f"{self.SYSTEM_PROMPT}\n\n{prompt}",
-                )
-                response_text = response.text or ""
-                return self._parse_response(response_text, results, question)
-            except Exception as e:
-                logger.warning(f"google.genai generation failed: {e}. Trying fallback.")
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=[
+                    {"role": "system", "content": self.SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+                response_format={"type": "json_object"},
+                max_tokens=4096,  # Generous headroom for reasoning tokens + JSON response
+                temperature=0.1,
+            )
+            response_text = response.choices[0].message.content or ""
+            return self._parse_response(response_text, results, question)
 
-        # 2. Try legacy google.generativeai SDK
-        if HAS_LEGACY_GENAI and self.legacy_model:
-            try:
-                response = self.legacy_model.generate_content([self.SYSTEM_PROMPT, prompt])
-                response_text = response.text or ""
-                return self._parse_response(response_text, results, question)
-            except Exception as e:
-                logger.warning(f"Legacy genai generation failed: {e}.")
-
-        # 3. Fallback to direct graph context synthesis
-        return self._build_heuristic_answer(question, results, context)
+        except Exception as e:
+            logger.warning(f"Groq API call failed: {e}. Falling back to graph evidence synthesis.")
+            return self._build_heuristic_answer(question, results, context)
 
     def _build_insufficient_evidence_answer(self, question: str) -> Answer:
         """Default response when no evidence exists in the graph."""

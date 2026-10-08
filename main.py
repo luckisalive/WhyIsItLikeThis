@@ -108,9 +108,11 @@ def cmd_query(args):
 
     logger.info("Connecting to Neo4j and initializing query engine...")
     neo4j_mgr = Neo4jManager(settings.neo4j_uri, settings.neo4j_username, settings.neo4j_password)
-    embedding_gen = EmbeddingGenerator(settings.google_api_key, settings.embedding_model)
+    embedding_gen = EmbeddingGenerator(
+        settings.google_api_key, settings.embedding_model, settings.embedding_dimensions
+    )
     retriever = WhyRetriever(neo4j_mgr, embedding_gen)
-    engine = AnswerEngine(settings.google_api_key, settings.gemini_model, retriever)
+    engine = AnswerEngine(settings.groq_api_key, settings.groq_model, retriever)
 
     try:
         logger.info("🔍 Searching for: %s", question)

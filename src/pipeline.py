@@ -28,15 +28,18 @@ class IngestionPipeline:
         self.cache = SQLiteCache()
         self.fetcher = GitHubFetcher(settings.github_token, settings.target_repo, self.cache)
         self.collator = ContextCollator()
-        self.decision_extractor = DecisionExtractor(settings.groq_api_key, settings.groq_model)
+        # Decision extraction powered by Google Gemini (gemini-3.5-flash-lite)
+        self.decision_extractor = DecisionExtractor(settings.google_api_key, settings.gemini_model)
         self.entity_extractor = CodeEntityExtractor()
         self.neo4j_mgr = Neo4jManager(settings.neo4j_uri, settings.neo4j_username, settings.neo4j_password)
-        self.embedding_gen = EmbeddingGenerator(settings.google_api_key, settings.embedding_model)
+        self.embedding_gen = EmbeddingGenerator(
+            settings.google_api_key, settings.embedding_model, settings.embedding_dimensions
+        )
 
-        # Groq client for supersession detection
+        # Groq client for supersession detection and reasoning (openai/gpt-oss-120b)
         from groq import Groq
         self.groq_client = Groq(api_key=settings.groq_api_key)
-        self.supersession_detector = SupersessionDetector(self.neo4j_mgr, self.groq_client)
+        self.supersession_detector = SupersessionDetector(self.neo4j_mgr, self.groq_client, settings.groq_model)
 
     async def run(self, progress_callback: Optional[Callable] = None):
         """Runs the complete end-to-end pipeline."""
