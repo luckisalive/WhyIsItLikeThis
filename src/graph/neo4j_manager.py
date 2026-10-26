@@ -442,20 +442,18 @@ class Neo4jManager:
         return results
 
     def get_decision_with_context(self, decision_id: str) -> Dict[str, Any]:
-        """Fetches a decision with its full neighborhood context (PR, commits, issues, people, entities)."""
+        """Fetches a decision with its full neighborhood context without fan-out."""
         query = """
         MATCH (d:Decision {id: $decision_id})
-        OPTIONAL MATCH (d)-[:DISCUSSED_IN]->(pr:PullRequest)
-        OPTIONAL MATCH (d)-[:IMPLEMENTED_IN]->(c:Commit)
-        OPTIONAL MATCH (d)-[:MOTIVATED_BY]->(i:Issue)
         OPTIONAL MATCH (d)-[:MADE_BY]->(p:Person)
-        OPTIONAL MATCH (d)-[:AFFECTS]->(e:CodeEntity)
-        OPTIONAL MATCH (d)-[:SUPERSEDES*]->(old_d:Decision)
-        OPTIONAL MATCH (new_d:Decision)-[:SUPERSEDES*]->(d)
-        RETURN d, pr, c, i, p,
-               collect(DISTINCT e) AS entities,
-               collect(DISTINCT old_d) AS superseded,
-               collect(DISTINCT new_d) AS superseded_by
+        RETURN d,
+               head([(d)-[:DISCUSSED_IN]->(pr:PullRequest) | pr]) AS pr,
+               head([(d)-[:IMPLEMENTED_IN]->(c:Commit) | c]) AS commit,
+               head([(d)-[:MOTIVATED_BY]->(i:Issue) | i]) AS issue,
+               p,
+               [(d)-[:AFFECTS]->(e:CodeEntity) | e] AS entities,
+               [(d)-[:SUPERSEDES*]->(old_d:Decision) | old_d] AS superseded,
+               [(new_d:Decision)-[:SUPERSEDES*]->(d) | new_d] AS superseded_by
         """
         try:
             records, _, _ = self.driver.execute_query(query, {"decision_id": decision_id})

@@ -1,0 +1,294 @@
+"""
+Verification script for framework-agnostic services against a live Neo4j database.
+Not part of pytest. Evaluates specific architectural invariants and regressions.
+"""
+
+import sys
+from datetime import datetime
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from settings import get_settings
+from src.graph.neo4j_manager import Neo4jManager
+from src.services import ask, decisions, graph, stats
+from src.services.decisions import DECISION_COUNT_QUERY
+
+
+def is_iso_or_none(val) -> bool:
+    if val is None:
+        return True
+    if not isinstance(val, str):
+        return isinstance(val, (datetime, type(None)))
+    try:
+        clean_val = val.replace("Z", "+00:00")
+        datetime.fromisoformat(clean_val)
+        return True
+    except Exception:
+        return False
+
+
+def main():
+    if sys.stdout.encoding != 'utf-8':
+        try:
+            sys.stdout.reconfigure(encoding='utf-8')
+        except Exception:
+            pass
+
+    print("=" * 70)
+    print("SERVICE LAYER VERIFICATION SUITE")
+    print("=" * 70)
+
+    settings = get_settings()
+    print(f"Target Repository : {settings.target_repo}")
+    print(f"Neo4j URI         : {settings.neo4j_uri}")
+
+    try:
+        neo4j_mgr = Neo4jManager(
+            settings.neo4j_uri,
+            settings.neo4j_username,
+            settings.neo4j_password,
+        )
+        neo4j_mgr.connect()
+        print("[CONNECTED] Connected to Neo4j successfully.\n")
+    except Exception as e:
+        print(f"[ERROR] FAILED to connect to Neo4j database: {e}\n")
+        print("Note: If using Neo4j AuraDB Free, the instance may be paused.")
+        print("Please ensure the instance is active at https://console.neo4j.io.")
+        sys.exit(1)
+
+    all_passed = True
+
+    # ─────────────────────────────────────────────────────────
+    # Invariant 1: count(ACTIVE) + count(SUPERSEDED) == count(all)
+    # ─────────────────────────────────────────────────────────
+    print("--- [Invariant 1] list_decisions status partition sum ---")
+    res_all = decisions.list_decisions(neo4j_mgr, status=None, limit=1)
+    res_active = decisions.list_decisions(neo4j_mgr, status="ACTIVE", limit=1)
+    res_super = decisions.list_decisions(neo4j_mgr, status="SUPERSEDED", limit=1)
+
+    total_all = res_all.total
+    total_active = res_active.total
+    total_super = res_super.total
+    inv1_pass = (total_active + total_super) == total_all
+
+    print(f"Total Decisions    : {total_all}")
+    print(f"Active Decisions   : {total_active}")
+    print(f"Superseded Decs    : {total_super}")
+    print(f"Active + Superseded: {total_active + total_super} == Total: {total_all}")
+    if inv1_pass:
+        print("Result: PASS\n")
+    else:
+        print(f"Result: FAIL (Difference: {total_all - (total_active + total_super)})\n")
+        all_passed = False
+
+    # ─────────────────────────────────────────────────────────
+    # Invariant 2: Pages don't overlap, exact length per page
+    # ─────────────────────────────────────────────────────────
+    print("--- [Invariant 2] Pagination length formula, non-overlap, and coverage ---")
+    step = 10
+    collected_ids = []
+    page_lens_correct = True
+
+    for offset in range(0, total_all, step):
+        page_res = decisions.list_decisions(neo4j_mgr, limit=step, offset=offset)
+        expected_len = min(step, max(0, total_all - offset))
+        actual_len = len(page_res.items)
+        if actual_len != expected_len:
+            print(f"[FAIL] Page at offset {offset}: expected len {expected_len}, got {actual_len}")
+            page_lens_correct = False
+
+        page_ids = [item["id"] for item in page_res.items]
+        collected_ids.extend(page_ids)
+
+    unique_ids = set(collected_ids)
+    no_duplicates = len(collected_ids) == len(unique_ids)
+    complete_union = len(unique_ids) == total_all
+    inv2_pass = page_lens_correct and no_duplicates and complete_union
+
+    print(f"Total Expected IDs : {total_all}")
+    print(f"Total Collected IDs: {len(collected_ids)}")
+    print(f"Unique IDs Count   : {len(unique_ids)}")
+    print(f"Duplicates Detected: {len(collected_ids) - len(unique_ids)}")
+    print(f"Page Lengths Valid : {page_lens_correct}")
+    if inv2_pass:
+        print("Result: PASS\n")
+    else:
+        print("Result: FAIL\n")
+        all_passed = False
+
+    # ─────────────────────────────────────────────────────────
+    # Invariant 3: Offset past total returns empty items with correct total
+    # ─────────────────────────────────────────────────────────
+    print("--- [Invariant 3] Offset past total boundary behavior ---")
+    past_offset = total_all + 50
+    past_res = decisions.list_decisions(neo4j_mgr, limit=10, offset=past_offset)
+    inv3_pass = (len(past_res.items) == 0) and (past_res.total == total_all)
+
+    print(f"Query with offset={past_offset} (total={total_all}):")
+    print(f"Returned Items Count: {len(past_res.items)}")
+    print(f"Reported Total      : {past_res.total}")
+    if inv3_pass:
+        print("Result: PASS\n")
+    else:
+        print("Result: FAIL\n")
+        all_passed = False
+
+    # ─────────────────────────────────────────────────────────
+    # Regression Test: Decision superseded by 2+ decisions
+    # ─────────────────────────────────────────────────────────
+    print("--- [Regression] Decision superseded by 2+ decisions appears exactly once ---")
+    check_multi_superseded_query = """
+    MATCH (newer:Decision)-[:SUPERSEDES]->(d:Decision)
+    WITH d, count(DISTINCT newer) AS newer_count
+    WHERE newer_count >= 2
+    RETURN d.id AS id, newer_count
+    LIMIT 5
+    """
+    multi_records = neo4j_mgr.execute_query(check_multi_superseded_query)
+    if multi_records:
+        target_multi_id = multi_records[0]["id"]
+        expected_newer_count = multi_records[0]["newer_count"]
+        print(f"Testing decision {target_multi_id} (superseded by {expected_newer_count} decisions)...")
+
+        # Collect all pages and verify target appears exactly once
+        multi_occurrences = [i for i in collected_ids if i == target_multi_id]
+        print(f"Occurrences across paginated list: {len(multi_occurrences)}")
+        if len(multi_occurrences) == 1:
+            print("Result: PASS\n")
+        else:
+            print(f"Result: FAIL (appeared {len(multi_occurrences)} times)\n")
+            all_passed = False
+    else:
+        print("No decisions in DB currently superseded by 2+ decisions to check live.")
+        print("Result: PASS (Fixture regression covered in pytest)\n")
+
+    # ─────────────────────────────────────────────────────────
+    # Invariant 4: Sidebar stats vs list_decisions status totals
+    # ─────────────────────────────────────────────────────────
+    print("--- [Invariant 4] Sidebar stats vs list_decisions status totals ---")
+    stats_res = stats.get_stats(neo4j_mgr)
+    sidebar_active = stats_res.stats.active_decisions if stats_res.stats else None
+    sidebar_super = stats_res.stats.superseded_decisions if stats_res.stats else None
+
+    inv4_pass = (sidebar_active == total_active) and (sidebar_super == total_super)
+    print(f"Sidebar Stats  : Active={sidebar_active}, Superseded={sidebar_super}")
+    print(f"list_decisions : Active={total_active}, Superseded={total_super}")
+
+    if inv4_pass:
+        print("Result: PASS\n")
+    else:
+        print("Result: FAIL")
+        print("\n[Cypher Comparison]")
+        print("1. Sidebar stats Cypher (from Neo4jManager.get_stats):")
+        print("   MATCH (d:Decision {status: 'ACTIVE'}) RETURN count(d) AS dec_active")
+        print("   MATCH (d:Decision {status: 'SUPERSEDED'}) RETURN count(d) AS dec_super")
+        print("   -> Relies exclusively on static d.status property.")
+        print("\n2. list_decisions Cypher (from src/services/decisions.py):")
+        print(DECISION_COUNT_QUERY.strip())
+        print("   -> Evaluates effective status including incoming [:SUPERSEDES] edges.\n")
+        all_passed = False
+
+    # ─────────────────────────────────────────────────────────
+    # Invariant 5: Decision with most affected entities
+    # ─────────────────────────────────────────────────────────
+    print("--- [Invariant 5] Decision with most affected entities (hidden_count) ---")
+    most_entities_query = """
+    MATCH (d:Decision)-[:AFFECTS]->(e:CodeEntity)
+    RETURN d.id AS id, count(DISTINCT e) AS entity_count
+    ORDER BY entity_count DESC
+    LIMIT 1
+    """
+    top_dec_records = neo4j_mgr.execute_query(most_entities_query)
+    if not top_dec_records:
+        print("No Decision with AFFECTS relationships found.")
+        print("Result: FAIL\n")
+        all_passed = False
+    else:
+        top_dec_id = top_dec_records[0]["id"]
+        real_entity_count = top_dec_records[0]["entity_count"]
+
+        graph_res = graph.get_decision_graph(neo4j_mgr, top_dec_id, entity_limit=5)
+        entity_nodes = [n for n in graph_res.nodes if n.type == "CodeEntity"]
+        node_count = len(entity_nodes)
+        hidden_count = graph_res.hidden_count
+
+        inv5_pass = (hidden_count > 0) and ((node_count + hidden_count) == real_entity_count)
+        print(f"Top Decision ID         : {top_dec_id}")
+        print(f"Direct Query Entity Cnt : {real_entity_count}")
+        print(f"Graph CodeEntity Nodes  : {node_count}")
+        print(f"Graph hidden_count      : {hidden_count}")
+        print(f"Nodes + hidden_count    : {node_count + hidden_count} == {real_entity_count}")
+        if inv5_pass:
+            print("Result: PASS\n")
+        else:
+            print("Result: FAIL\n")
+            all_passed = False
+
+    # ─────────────────────────────────────────────────────────
+    # Invariant 6: Real ask() call evidence date ISO or None
+    # ─────────────────────────────────────────────────────────
+    print("--- [Invariant 6] Evidence date format on real ask() call ---")
+    test_question = "Why does requests use urllib3?"
+    print(f"Calling ask.answer('{test_question}')...")
+    ask_res = ask.answer(test_question, neo4j_mgr, settings=settings)
+
+    if not ask_res.answer or not ask_res.answer.evidence:
+        print("No evidence items returned by ask.answer.")
+        inv6_pass = False
+    else:
+        commit_matches = 0
+        pr_matches = 0
+        issue_matches = 0
+        non_none_dates = 0
+
+        print(f"Evidence items count: {len(ask_res.answer.evidence)}")
+        for i, ev in enumerate(ask_res.answer.evidence, 1):
+            stype = ev.source_type.lower()
+            valid_date = is_iso_or_none(ev.date)
+            has_date = ev.date is not None
+            if has_date and valid_date:
+                non_none_dates += 1
+                if "commit" in stype:
+                    commit_matches += 1
+                elif "pr" in stype or "pull" in stype:
+                    pr_matches += 1
+                elif "issue" in stype:
+                    issue_matches += 1
+
+            # For commits: print evidence source_id and retrieval context keys
+            if "commit" in stype:
+                print(f"  [COMMIT EVIDENCE] source_id: '{ev.source_id}', date: {repr(ev.date)}")
+                # Inspect retriever context commits
+                engine = getattr(ask, "_last_engine", None)
+
+            print(f"  {i}. [{ev.source_type}] {ev.source_id} -> Date: {repr(ev.date)} (Valid ISO: {valid_date})")
+
+        print(f"\nMatch Counts with Dates:")
+        print(f"  Commits with dates : {commit_matches}")
+        print(f"  PRs with dates     : {pr_matches}")
+        print(f"  Issues with dates  : {issue_matches}")
+        print(f"  Total with dates   : {non_none_dates}")
+
+        # FAIL unless at least one commit/PR/issue evidence item has a non-None ISO date
+        inv6_pass = (non_none_dates >= 1)
+
+    if inv6_pass:
+        print("Result: PASS\n")
+    else:
+        print("Result: FAIL (No evidence item has a non-None valid date)\n")
+        all_passed = False
+
+    print("=" * 70)
+    print(f"OVERALL SUITE: {'ALL PASSED' if all_passed else 'SOME INVARIANTS FAILED'}")
+    print("=" * 70)
+
+    neo4j_mgr.close()
+    if not all_passed:
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

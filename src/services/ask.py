@@ -6,7 +6,7 @@ Framework-agnostic: no Streamlit imports or session state.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set
 
 from src.graph.embedding_generator import EmbeddingGenerator
 from src.graph.neo4j_manager import Neo4jManager
@@ -42,44 +42,96 @@ def create_answer_engine(neo4j_mgr: Neo4jManager, settings: Any) -> AnswerEngine
     )
 
 
-def _build_context_date_lookup(results: List[Dict[str, Any]]) -> Dict[Tuple[str, str], Any]:
+def _match_commit_date(source_id: str, results: List[Dict[str, Any]]) -> Optional[Any]:
     """
-    Builds an exact (source_type, source_id) -> date lookup table from retrieval context.
+    Match commit date from retrieval context.
+    - If SHAs differ in length: normalize and match on unique prefix.
+    - If ambiguous (multiple prefix matches): return None.
+    - No fuzzy matching.
     """
-    lookup: Dict[Tuple[str, str], Any] = {}
+    if not source_id or not results:
+        return None
+
+    target = source_id.lower().strip()
+    if target.startswith("commit"):
+        target = target[6:].strip()
+    target = target.lstrip("#").strip()
+    if not target:
+        return None
+
+    # Collect all unique commit nodes from retrieval results
+    commits_by_sha: Dict[str, Dict[str, Any]] = {}
+    for res in results:
+        for c in res.get("commits", []):
+            if isinstance(c, dict) and c.get("sha"):
+                sha_str = str(c["sha"]).lower().strip()
+                if sha_str not in commits_by_sha:
+                    commits_by_sha[sha_str] = c
+
+    if not commits_by_sha:
+        return None
+
+    # 1. Exact full SHA match
+    if target in commits_by_sha:
+        return commits_by_sha[target].get("date")
+
+    # 2. Length difference: target is prefix of full SHA
+    prefix_matches = [
+        c for sha, c in commits_by_sha.items()
+        if sha.startswith(target)
+    ]
+    if len(prefix_matches) == 1:
+        return prefix_matches[0].get("date")
+    elif len(prefix_matches) > 1:
+        logger.warning(f"Ambiguous commit prefix '{target}' matches multiple commits.")
+        return None
+
+    # Target is longer than stored SHA
+    reverse_matches = [
+        c for sha, c in commits_by_sha.items()
+        if target.startswith(sha)
+    ]
+    if len(reverse_matches) == 1:
+        return reverse_matches[0].get("date")
+    elif len(reverse_matches) > 1:
+        logger.warning(f"Ambiguous reverse commit match for '{target}'.")
+        return None
+
+    return None
+
+
+def _match_pr_date(source_id: str, results: List[Dict[str, Any]]) -> Optional[Any]:
+    """Exact PR number match against retrieval context."""
+    target = str(source_id).lower().strip().lstrip("#").strip()
+    if target.startswith("pr"):
+        target = target[2:].strip().lstrip("#").strip()
+    if not target:
+        return None
 
     for res in results:
-        # Pull Requests
         for pr in res.get("pull_requests", []):
             if isinstance(pr, dict):
-                pr_num = str(pr.get("number", ""))
-                pr_date = pr.get("created_at") or pr.get("merged_at")
-                lookup[("pull_request", pr_num)] = pr_date
-                lookup[("pr", pr_num)] = pr_date
+                pr_num = str(pr.get("number", "")).strip()
+                if pr_num == target:
+                    return pr.get("created_at") or pr.get("merged_at")
+    return None
 
-        # Commits
-        for c in res.get("commits", []):
-            if isinstance(c, dict):
-                sha = str(c.get("sha", ""))
-                c_date = c.get("date")
-                lookup[("commit", sha)] = c_date
-                if len(sha) >= 7:
-                    lookup[("commit", sha[:7])] = c_date
 
-        # Issues
+def _match_issue_date(source_id: str, results: List[Dict[str, Any]]) -> Optional[Any]:
+    """Exact issue number match against retrieval context."""
+    target = str(source_id).lower().strip().lstrip("#").strip()
+    if target.startswith("issue"):
+        target = target[5:].strip().lstrip("#").strip()
+    if not target:
+        return None
+
+    for res in results:
         for iss in res.get("issues", []):
             if isinstance(iss, dict):
-                iss_num = str(iss.get("number", ""))
-                iss_date = iss.get("created_at")
-                lookup[("issue", iss_num)] = iss_date
-
-        # Decisions (in case any decision has a date field)
-        dec = res.get("decision", {})
-        if isinstance(dec, dict):
-            d_id = str(dec.get("id", ""))
-            lookup[("decision", d_id)] = dec.get("date")
-
-    return lookup
+                iss_num = str(iss.get("number", "")).strip()
+                if iss_num == target:
+                    return iss.get("created_at")
+    return None
 
 
 def answer(
@@ -93,7 +145,7 @@ def answer(
     Answer an architectural question using GraphRAG.
 
     - related_decisions: retains model suggestions filtered to IDs present in retrieval context.
-    - evidence.date: populated by exact (source_type, source_id) join against retrieval context; None if no match.
+    - evidence.date: normalized exact or unique-prefix join against retrieval context; None if no match.
     - model_used & degraded: tracked on AskResult.
     - Error handling: returns DB_UNREACHABLE, NO_RESULTS, LLM_UNAVAILABLE without raising.
     """
@@ -177,23 +229,33 @@ def answer(
         ans.related_decisions = filtered_related
 
         # 4. Join evidence dates from retrieval context
-        date_lookup = _build_context_date_lookup(retrieval_results)
         for ev in ans.evidence:
             stype = ev.source_type.lower().strip()
             sid = str(ev.source_id).strip()
-            ev.date = date_lookup.get((stype, sid), None)
+            if stype in ("commit", "c"):
+                ev.date = _match_commit_date(sid, retrieval_results)
+            elif stype in ("pull_request", "pr"):
+                ev.date = _match_pr_date(sid, retrieval_results)
+            elif stype in ("issue", "iss"):
+                ev.date = _match_issue_date(sid, retrieval_results)
+            else:
+                ev.date = None
 
         # 5. Determine model used and degraded status
-        all_exhausted = getattr(engine, "all_models_exhausted", False)
+        all_exhausted = bool(getattr(engine, "all_models_exhausted", False))
         active_idx = getattr(engine, "active_model_idx", 0)
         gemini_idx = getattr(engine, "active_gemini_idx", 0)
+        try:
+            is_fallback_active = (int(active_idx) > 0 or int(gemini_idx) > 0)
+        except (TypeError, ValueError):
+            is_fallback_active = False
 
         if all_exhausted or getattr(engine, "_is_placeholder", False):
             model_used = "heuristic_graph_synthesis"
             degraded = True
         else:
             model_used = getattr(engine, "current_model", "groq/openai/gpt-oss-120b")
-            degraded = (active_idx > 0 or gemini_idx > 0)
+            degraded = is_fallback_active
 
         return AskResult(
             answer=ans,

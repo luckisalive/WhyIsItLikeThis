@@ -117,7 +117,6 @@ def test_ask_llm_unavailable_when_all_models_exhausted_and_heuristic_bypassed():
 def test_list_decisions_exact_cypher_and_parameters():
     """Assert on exact Cypher and parameters for ordering, pagination, and filters."""
     mock_mgr = MagicMock()
-    # Mock count query -> total 42; mock page query -> empty list
     mock_mgr.execute_query.side_effect = [
         [{"total": 42}],
         [],
@@ -168,12 +167,12 @@ def test_list_decisions_shaping_and_status_consistency():
         # Decision 1: status ACTIVE, no newer -> ACTIVE
         {
             "d": {"id": "DEC-01", "title": "Base Model", "status": "ACTIVE", "rationale": "Simplicity"},
-            "newer": None,
+            "superseded_by": [],
         },
         # Decision 2: status ACTIVE in property, but newer exists -> SUPERSEDED
         {
             "d": {"id": "DEC-02", "title": "Old Routing", "status": "ACTIVE", "rationale": "Fast"},
-            "newer": {"id": "DEC-03", "title": "New Routing"},
+            "superseded_by": [{"id": "DEC-03", "title": "New Routing"}],
         },
     ]
     mock_mgr.execute_query.side_effect = [
@@ -191,11 +190,60 @@ def test_list_decisions_shaping_and_status_consistency():
     assert item1["id"] == "DEC-01"
     assert item1["status"] == "ACTIVE"
     assert item1["is_superseded"] is False
+    assert item1["newer"] is None
 
     item2 = result.items[1]
     assert item2["id"] == "DEC-02"
     assert item2["status"] == "SUPERSEDED"  # Determined by newer supersedes edge
     assert item2["is_superseded"] is True
+    assert item2["newer"]["id"] == "DEC-03"
+
+
+def test_list_decisions_superseded_by_multiple_decisions_regression():
+    """
+    Regression test for BUG A:
+    A decision superseded by 2+ decisions must appear exactly once in items
+    with superseded_by as a list.
+    """
+    mock_mgr = MagicMock()
+    fixture_records = [
+        {
+            "d": {"id": "DEC-01", "title": "Original Config", "status": "SUPERSEDED"},
+            "superseded_by": [
+                {"id": "DEC-02", "title": "First Override"},
+                {"id": "DEC-03", "title": "Second Override"},
+            ],
+        }
+    ]
+    mock_mgr.execute_query.side_effect = [
+        [{"total": 1}],
+        fixture_records,
+    ]
+
+    result = decisions.list_decisions(mock_mgr, limit=10, offset=0)
+
+    assert result.success is True
+    assert result.total == 1
+    # Exactly one item, not duplicated
+    assert len(result.items) == 1
+    item = result.items[0]
+    assert item["id"] == "DEC-01"
+    assert len(item["superseded_by"]) == 2
+    assert item["newer"]["id"] == "DEC-02"
+    assert item["is_superseded"] is True
+
+
+def test_list_decisions_offset_past_total():
+    """Verify offset past total returns empty items with total preserved and no error."""
+    mock_mgr = MagicMock()
+    mock_mgr.execute_query.return_value = [{"total": 15}]
+
+    result = decisions.list_decisions(mock_mgr, limit=10, offset=20)
+
+    assert result.success is True
+    assert result.error is None
+    assert result.total == 15
+    assert len(result.items) == 0
 
 
 # ─────────────────────────────────────────────────────────────
@@ -283,7 +331,7 @@ def test_ask_evidence_dates_and_filtered_related_decisions():
                 {"number": 101, "title": "Starlette PR", "created_at": "2023-01-15T10:00:00Z"}
             ],
             "commits": [
-                {"sha": "a1b2c3d4e5f6", "date": "2023-01-16T12:00:00Z"}
+                {"sha": "a1b2c3d4e5f6789012345678901234567890abcd", "date": "2023-01-16T12:00:00Z"}
             ],
             "issues": [
                 {"number": 55, "title": "ASGI Issue", "created_at": "2023-01-14T08:00:00Z"}
@@ -311,9 +359,10 @@ def test_ask_evidence_dates_and_filtered_related_decisions():
                 title="PR 101",
                 summary="PR Discussion",
             ),
+            # Evidence with short SHA prefix (7 chars)
             EvidenceItem(
                 source_type="commit",
-                source_id="a1b2c3d4e5f6",
+                source_id="a1b2c3d",
                 title="Commit",
                 summary="Implementation",
             ),
@@ -346,9 +395,50 @@ def test_ask_evidence_dates_and_filtered_related_decisions():
     # Verify hallucinated decision was filtered out
     assert ans.related_decisions == ["DEC-42"]
 
-    # Verify exact date join
+    # Verify exact date join (including normalized prefix match for commit)
     ev_map = {f"{e.source_type}:{e.source_id}": e for e in ans.evidence}
     assert ev_map["pull_request:101"].date == "2023-01-15T10:00:00Z"
-    assert ev_map["commit:a1b2c3d4e5f6"].date == "2023-01-16T12:00:00Z"
+    assert ev_map["commit:a1b2c3d"].date == "2023-01-16T12:00:00Z"
     assert ev_map["issue:55"].date == "2023-01-14T08:00:00Z"
     assert ev_map["pull_request:9999"].date is None  # Unmatched -> None
+
+
+def test_ask_commit_date_ambiguous_prefix_returns_none():
+    """Verify ambiguous commit SHA prefix matching 2+ commits returns None."""
+    mock_mgr = MagicMock()
+    mock_engine = MagicMock()
+    mock_retriever = MagicMock()
+
+    retrieval_fixture = [
+        {
+            "decision": {"id": "DEC-1"},
+            "commits": [
+                {"sha": "a1b2c3d4_one", "date": "2023-01-01T00:00:00Z"},
+                {"sha": "a1b2c3d4_two", "date": "2023-02-02T00:00:00Z"},
+            ],
+        }
+    ]
+    mock_retriever.retrieve.return_value = retrieval_fixture
+    mock_engine.retriever = mock_retriever
+    mock_engine.current_model = "test-model"
+    mock_engine.all_models_exhausted = False
+    mock_engine._is_placeholder = False
+
+    raw_answer = Answer(
+        question="Why?",
+        answer_text="Test",
+        evidence=[
+            EvidenceItem(
+                source_type="commit",
+                source_id="a1b2c3d4",  # Matches BOTH commits above!
+                title="Ambiguous Commit",
+            )
+        ],
+    )
+    mock_engine.answer.return_value = raw_answer
+
+    result = ask.answer("Why?", mock_mgr, answer_engine=mock_engine)
+
+    assert result.success is True
+    # Ambiguous prefix must evaluate to None
+    assert result.answer.evidence[0].date is None

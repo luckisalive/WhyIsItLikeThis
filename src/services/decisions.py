@@ -30,6 +30,8 @@ WHERE ($type IS NULL OR d.decision_type = $type OR d.type = $type)
 RETURN count(d) AS total
 """
 
+# Paginate decisions FIRST via WITH ... SKIP ... LIMIT, then attach superseding decisions.
+# This prevents row multiplication / fan-out when a decision is superseded by 2+ decisions.
 DECISION_PAGE_QUERY = """
 MATCH (d:Decision)
 WHERE ($type IS NULL OR d.decision_type = $type OR d.type = $type)
@@ -38,11 +40,13 @@ WHERE ($type IS NULL OR d.decision_type = $type OR d.type = $type)
     OR ($status = 'SUPERSEDED' AND (d.status = 'SUPERSEDED' OR EXISTS { MATCH (:Decision)-[:SUPERSEDES]->(d) }))
     OR ($status = 'ACTIVE' AND (d.status = 'ACTIVE' OR d.status IS NULL) AND NOT EXISTS { MATCH (:Decision)-[:SUPERSEDES]->(d) })
   )
-OPTIONAL MATCH (newer:Decision)-[:SUPERSEDES]->(d)
-RETURN d, newer
+WITH d
 ORDER BY d.id ASC, d.title ASC
 SKIP $offset
 LIMIT $limit
+OPTIONAL MATCH (newer:Decision)-[:SUPERSEDES]->(d)
+RETURN d, collect(DISTINCT newer) AS superseded_by
+ORDER BY d.id ASC, d.title ASC
 """
 
 
@@ -98,14 +102,20 @@ def list_decisions(
                 ),
             )
 
+        # If offset is at or past total, return empty items with total preserved and no error
+        if offset >= total:
+            return DecisionListResult(items=[], total=total)
+
         page_records = neo4j_mgr.execute_query(DECISION_PAGE_QUERY, params)
         items: List[Dict[str, Any]] = []
 
         for rec in page_records:
             d = rec.get("d") or {}
-            newer = rec.get("newer")
+            raw_superseded_by = rec.get("superseded_by", [])
+            superseded_by = [dict(s) for s in raw_superseded_by if s]
+
             stored_status = d.get("status", "ACTIVE")
-            is_superseded = stored_status == "SUPERSEDED" or bool(newer)
+            is_superseded = stored_status == "SUPERSEDED" or len(superseded_by) > 0
             effective_status = "SUPERSEDED" if is_superseded else "ACTIVE"
 
             items.append({
@@ -116,7 +126,8 @@ def list_decisions(
                 "is_superseded": is_superseded,
                 "rationale": d.get("rationale", "No rationale documented."),
                 "problem_context": d.get("problem_context", ""),
-                "newer": newer,
+                "newer": superseded_by[0] if superseded_by else None,
+                "superseded_by": superseded_by,
                 "d": d,
             })
 
@@ -128,7 +139,7 @@ def list_decisions(
         if "connect" in err_msg or "unreachable" in err_msg or "serviceunavailable" in err_msg or "defunct" in err_msg:
             code = ErrorCode.DB_UNREACHABLE
         else:
-            code = ErrorCode.DB_UNREACHABLE  # query execution against DB
+            code = ErrorCode.DB_UNREACHABLE
         return DecisionListResult(
             error=ServiceError(
                 code=code,
