@@ -442,39 +442,38 @@ class Neo4jManager:
         return results
 
     def get_decision_with_context(self, decision_id: str) -> Dict[str, Any]:
-        """Fetches a decision with its full neighborhood context (PR, commits, issues, people, entities)."""
+        """Fetches a decision with its full neighborhood context without fan-out."""
         query = """
         MATCH (d:Decision {id: $decision_id})
+        OPTIONAL MATCH (d)-[:MADE_BY]->(p:Person)
         OPTIONAL MATCH (d)-[:DISCUSSED_IN]->(pr:PullRequest)
         OPTIONAL MATCH (d)-[:IMPLEMENTED_IN]->(c:Commit)
         OPTIONAL MATCH (d)-[:MOTIVATED_BY]->(i:Issue)
-        OPTIONAL MATCH (d)-[:MADE_BY]->(p:Person)
-        OPTIONAL MATCH (d)-[:AFFECTS]->(e:CodeEntity)
-        OPTIONAL MATCH (d)-[:SUPERSEDES*]->(old_d:Decision)
-        OPTIONAL MATCH (new_d:Decision)-[:SUPERSEDES*]->(d)
-        RETURN d, pr, c, i, p,
-               collect(DISTINCT e) AS entities,
-               collect(DISTINCT old_d) AS superseded,
-               collect(DISTINCT new_d) AS superseded_by
+        WITH d, p, pr, c, i
+        RETURN d,
+               pr,
+               c AS commit,
+               i AS issue,
+               p AS author,
+               [(d)-[:AFFECTS]->(e:CodeEntity) | e] AS entities,
+               [(d)-[:SUPERSEDES]->(old_d:Decision) | old_d] AS superseded,
+               [(new_d:Decision)-[:SUPERSEDES]->(d) | new_d] AS superseded_by
+        LIMIT 1
         """
-        try:
-            records, _, _ = self.driver.execute_query(query, {"decision_id": decision_id})
-            if not records:
-                return {}
-            record = records[0]
-            return {
-                "decision": dict(record["d"]) if record["d"] else None,
-                "pr": dict(record["pr"]) if record["pr"] else None,
-                "commit": dict(record["c"]) if record["c"] else None,
-                "issue": dict(record["i"]) if record["i"] else None,
-                "author": dict(record["p"]) if record["p"] else None,
-                "entities": [dict(e) for e in record["entities"] if e],
-                "superseded": [dict(d) for d in record["superseded"] if d],
-                "superseded_by": [dict(d) for d in record["superseded_by"] if d],
-            }
-        except Exception as e:
-            logger.error(f"Failed to get decision context for {decision_id}: {e}")
+        records, _, _ = self.driver.execute_query(query, {"decision_id": decision_id})
+        if not records:
             return {}
+        record = records[0]
+        return {
+            "decision": dict(record["d"]) if record.get("d") else None,
+            "pr": dict(record["pr"]) if record.get("pr") else None,
+            "commit": dict(record["commit"]) if record.get("commit") else None,
+            "issue": dict(record["issue"]) if record.get("issue") else None,
+            "author": dict(record["author"]) if record.get("author") else None,
+            "entities": [dict(e) for e in record.get("entities", []) if e],
+            "superseded": [dict(d) for d in record.get("superseded", []) if d],
+            "superseded_by": [dict(d) for d in record.get("superseded_by", []) if d],
+        }
 
     def find_overlapping_decisions(self) -> List[Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]]:
         """Finds pairs of ACTIVE decisions that AFFECT the same CodeEntity."""
