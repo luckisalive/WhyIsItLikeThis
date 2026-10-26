@@ -66,6 +66,20 @@ def test_graph_no_results_when_decision_not_found():
     assert "DEC-NONEXISTENT" in result.error.message
 
 
+def test_graph_driver_exception_does_not_become_no_results():
+    """Verify that a driver exception during get_decision_graph does NOT become NO_RESULTS."""
+    mock_mgr = MagicMock()
+    mock_mgr.get_decision_with_context.side_effect = Exception("Neo4j driver pool defunct or failed query")
+
+    result = graph.get_decision_graph(mock_mgr, "DEC-PR-7497")
+
+    assert result.success is False
+    assert result.error is not None
+    # Must NOT be NO_RESULTS
+    assert result.error.code != ErrorCode.NO_RESULTS
+    assert result.error.code in (ErrorCode.DB_UNREACHABLE, ErrorCode.UNKNOWN)
+
+
 def test_ask_no_results_when_retriever_finds_nothing():
     """Verify ask returns NO_RESULTS when graph has no matching context."""
     mock_mgr = MagicMock()
@@ -291,17 +305,17 @@ def test_get_decision_graph_full_neighborhood_and_hidden_count():
 
     # Verify real_id preserved in properties
     node_map = {n.id: n for n in result.nodes}
-    assert node_map["DEC-DEC-42"].properties["real_id"] == "DEC-42"
+    assert node_map["DEC-42"].properties["real_id"] == "DEC-42"
     assert node_map["PR-101"].properties["real_id"] == "101"
     assert node_map["COMMIT-a1b2c3d4e5f6"].properties["real_id"] == "a1b2c3d4e5f6"
     assert node_map["ISSUE-55"].properties["real_id"] == "55"
     assert node_map["PERSON-tiangolo"].properties["real_id"] == "tiangolo"
 
     # Verify older & newer superseding decisions
-    assert "DEC-DEC-10" in node_map
-    assert node_map["DEC-DEC-10"].label == "Old: Flask routing"
-    assert "DEC-DEC-90" in node_map
-    assert node_map["DEC-DEC-90"].label == "New: Next-gen ASGI"
+    assert "DEC-10" in node_map
+    assert node_map["DEC-10"].label == "Old: Flask routing"
+    assert "DEC-90" in node_map
+    assert node_map["DEC-90"].label == "New: Next-gen ASGI"
 
     # Verify edge labels
     edge_labels = {e.label for e in result.edges}

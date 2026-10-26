@@ -3,9 +3,16 @@ Verification script for framework-agnostic services against a live Neo4j databas
 Not part of pytest. Evaluates specific architectural invariants and regressions.
 """
 
+import logging
 import sys
+import warnings
 from datetime import datetime
 from pathlib import Path
+
+# Silence Neo4j deprecation notifications and verbose logs
+warnings.filterwarnings("ignore")
+logging.getLogger("neo4j").setLevel(logging.ERROR)
+logging.getLogger("neo4j.notifications").setLevel(logging.ERROR)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -60,6 +67,35 @@ def main():
         sys.exit(1)
 
     all_passed = True
+
+    # ─────────────────────────────────────────────────────────
+    # DIAGNOSTIC: Sample node properties (Commit, PullRequest, Issue)
+    # ─────────────────────────────────────────────────────────
+    print("--- [DIAGNOSTIC] Node properties and date fields in live database ---")
+    try:
+        c_sample = neo4j_mgr.execute_query("MATCH (c:Commit) RETURN keys(c) AS keys, c LIMIT 1")
+        if c_sample:
+            print(f"Commit keys       : {c_sample[0]['keys']}")
+            print(f"Commit sample 'date': {repr(c_sample[0]['c'].get('date'))}")
+        else:
+            print("No Commit nodes found in database.")
+
+        pr_sample = neo4j_mgr.execute_query("MATCH (pr:PullRequest) RETURN keys(pr) AS keys, pr LIMIT 1")
+        if pr_sample:
+            print(f"PullRequest keys  : {pr_sample[0]['keys']}")
+            print(f"PR sample created : {repr(pr_sample[0]['pr'].get('created_at'))}")
+        else:
+            print("No PullRequest nodes found in database.")
+
+        iss_sample = neo4j_mgr.execute_query("MATCH (i:Issue) RETURN keys(i) AS keys, i LIMIT 1")
+        if iss_sample:
+            print(f"Issue keys        : {iss_sample[0]['keys']}")
+            print(f"Issue sample created: {repr(iss_sample[0]['i'].get('created_at'))}")
+        else:
+            print("No Issue nodes found in database.")
+        print()
+    except Exception as diag_e:
+        print(f"Diagnostic error: {diag_e}\n")
 
     # ─────────────────────────────────────────────────────────
     # Invariant 1: count(ACTIVE) + count(SUPERSEDED) == count(all)
@@ -153,7 +189,6 @@ def main():
         expected_newer_count = multi_records[0]["newer_count"]
         print(f"Testing decision {target_multi_id} (superseded by {expected_newer_count} decisions)...")
 
-        # Collect all pages and verify target appears exactly once
         multi_occurrences = [i for i in collected_ids if i == target_multi_id]
         print(f"Occurrences across paginated list: {len(multi_occurrences)}")
         if len(multi_occurrences) == 1:
@@ -211,16 +246,24 @@ def main():
         real_entity_count = top_dec_records[0]["entity_count"]
 
         graph_res = graph.get_decision_graph(neo4j_mgr, top_dec_id, entity_limit=5)
-        entity_nodes = [n for n in graph_res.nodes if n.type == "CodeEntity"]
-        node_count = len(entity_nodes)
-        hidden_count = graph_res.hidden_count
+        if not graph_res.success:
+            print(f"[FAIL] get_decision_graph failed: {graph_res.error.message}")
+            inv5_pass = False
+        else:
+            entity_nodes = [n for n in graph_res.nodes if n.type == "CodeEntity"]
+            node_count = len(entity_nodes)
+            hidden_count = graph_res.hidden_count
+            all_node_ids = [n.id for n in graph_res.nodes]
+            no_duplicate_nodes = len(all_node_ids) == len(set(all_node_ids))
 
-        inv5_pass = (hidden_count > 0) and ((node_count + hidden_count) == real_entity_count)
-        print(f"Top Decision ID         : {top_dec_id}")
-        print(f"Direct Query Entity Cnt : {real_entity_count}")
-        print(f"Graph CodeEntity Nodes  : {node_count}")
-        print(f"Graph hidden_count      : {hidden_count}")
-        print(f"Nodes + hidden_count    : {node_count + hidden_count} == {real_entity_count}")
+            inv5_pass = (hidden_count > 0) and ((node_count + hidden_count) == real_entity_count) and no_duplicate_nodes
+            print(f"Top Decision ID         : {top_dec_id}")
+            print(f"Direct Query Entity Cnt : {real_entity_count}")
+            print(f"Graph CodeEntity Nodes  : {node_count}")
+            print(f"Graph hidden_count      : {hidden_count}")
+            print(f"Nodes + hidden_count    : {node_count + hidden_count} == {real_entity_count}")
+            print(f"No Duplicate Node IDs   : {no_duplicate_nodes} (Total nodes: {len(all_node_ids)})")
+
         if inv5_pass:
             print("Result: PASS\n")
         else:
@@ -258,11 +301,8 @@ def main():
                 elif "issue" in stype:
                     issue_matches += 1
 
-            # For commits: print evidence source_id and retrieval context keys
             if "commit" in stype:
                 print(f"  [COMMIT EVIDENCE] source_id: '{ev.source_id}', date: {repr(ev.date)}")
-                # Inspect retriever context commits
-                engine = getattr(ask, "_last_engine", None)
 
             print(f"  {i}. [{ev.source_type}] {ev.source_id} -> Date: {repr(ev.date)} (Valid ISO: {valid_date})")
 
@@ -272,14 +312,31 @@ def main():
         print(f"  Issues with dates  : {issue_matches}")
         print(f"  Total with dates   : {non_none_dates}")
 
-        # FAIL unless at least one commit/PR/issue evidence item has a non-None ISO date
+        # Invariant 6: FAIL unless at least one commit/PR/issue evidence item has a non-None ISO date
         inv6_pass = (non_none_dates >= 1)
 
     if inv6_pass:
         print("Result: PASS\n")
     else:
-        print("Result: FAIL (No evidence item has a non-None valid date)\n")
+        print("Result: FAIL (No evidence item has a non-None valid ISO date)\n")
         all_passed = False
+
+    # ─────────────────────────────────────────────────────────
+    # EXPERIMENT 3: Evidence Determinism (3 runs of same question)
+    # ─────────────────────────────────────────────────────────
+    print("--- [EXPERIMENT 3] Evidence Determinism (3 runs of same question) ---")
+    det_question = "Why was default timeout not set in requests?"
+    print(f"Evaluating determinism on question: '{det_question}'\n")
+    for run_idx in range(1, 4):
+        print(f"--- Run {run_idx} ---")
+        run_res = ask.answer(det_question, neo4j_mgr, settings=settings)
+        if run_res.answer and run_res.answer.evidence:
+            print(f"Evidence count: {len(run_res.answer.evidence)}")
+            for j, ev in enumerate(run_res.answer.evidence, 1):
+                print(f"  {j}. source_type={ev.source_type}, source_id={ev.source_id}, title={ev.title[:30]}..., date={ev.date}")
+        else:
+            print("  (No evidence returned or answer unavailable)")
+        print()
 
     print("=" * 70)
     print(f"OVERALL SUITE: {'ALL PASSED' if all_passed else 'SOME INVARIANTS FAILED'}")
