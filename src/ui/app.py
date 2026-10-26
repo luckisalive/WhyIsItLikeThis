@@ -153,6 +153,10 @@ def main():
                     if answer.ask_person:
                         st.info(f"👤 **Person to consult for more context:** `@{answer.ask_person}`")
 
+                    # Related Decisions
+                    if answer.related_decisions:
+                        st.caption(f"🔗 **Related Decisions:** {', '.join(answer.related_decisions)}")
+
                     # Evidence Cards
                     if answer.evidence:
                         st.markdown("### 📎 Evidence Chain")
@@ -161,6 +165,8 @@ def main():
                                 st.write(f"**Summary:** {ev.summary}")
                                 if ev.person:
                                     st.write(f"**Author / Contributor:** `@{ev.person}`")
+                                if ev.date:
+                                    st.write(f"**Date:** `{ev.date}`")
                                 if ev.url:
                                     st.markdown(f"**Direct Link:** [{ev.url}]({ev.url})")
 
@@ -175,7 +181,7 @@ def main():
             st.info("Connect to Neo4j AuraDB to visualize graph relationships.")
         else:
             try:
-                decisions_result = decisions.list_decisions(neo4j_mgr)
+                decisions_result = decisions.list_decisions(neo4j_mgr, limit=50)
                 if not decisions_result.success:
                     st.error(f"Error loading graph explorer: {decisions_result.error.message if decisions_result.error else 'Unknown error'}")
                 elif decisions_result.items:
@@ -208,23 +214,35 @@ def main():
                             if HAS_AGRAPH:
                                 nodes = []
                                 edges = []
+                                root_node_id = f"DEC-{selected_id}"
+
                                 for gn in graph_result.nodes:
-                                    if gn.type == "Decision" and gn.id == str(selected_id):
+                                    if gn.type == "Decision" and (gn.id == root_node_id or gn.id == str(selected_id)):
                                         nodes.append(Node(id=gn.id, label=gn.label[:25] + "...", color="#1E88E5", size=25))
                                     elif gn.type == "PullRequest":
                                         nodes.append(Node(id=gn.id, label=gn.label, color="#43A047", size=18))
                                     elif gn.type == "Commit":
-                                        nodes.append(Node(id=gn.id, label=gn.label, color="#FB8C00", size=18))
+                                        nodes.append(Node(id=gn.id, label=gn.label[:20], color="#FB8C00", size=18))
+                                    elif gn.type == "Issue":
+                                        nodes.append(Node(id=gn.id, label=gn.label[:20], color="#0288D1", size=18))
+                                    elif gn.type == "Person":
+                                        nodes.append(Node(id=gn.id, label=gn.label, color="#7B1FA2", size=18))
                                     elif gn.type == "CodeEntity":
                                         nodes.append(Node(id=gn.id, label=gn.label[:20], color="#8E24AA", size=15))
                                     elif gn.type == "Decision":
-                                        nodes.append(Node(id=gn.id, label=gn.label[:15], color="#E53935", size=15))
+                                        # Older or Newer superseding decision
+                                        is_newer = gn.label.startswith("New:") or gn.label.startswith("Newer:")
+                                        color = "#D32F2F" if is_newer else "#E53935"
+                                        nodes.append(Node(id=gn.id, label=gn.label[:20], color=color, size=18 if is_newer else 15))
 
                                 for ge in graph_result.edges:
                                     edges.append(Edge(source=ge.source, target=ge.target, label=ge.label))
 
                                 config = Config(width=650, height=450, directed=True, nodeHighlightBehavior=True)
                                 agraph(nodes=nodes, edges=edges, config=config)
+
+                                if graph_result.hidden_count > 0:
+                                    st.caption(f"ℹ️ +{graph_result.hidden_count} additional code entities omitted from graph view.")
                             else:
                                 st.info("Install `streamlit-agraph` for interactive graph rendering.")
                 else:
@@ -243,30 +261,33 @@ def main():
             st.info("Connect to Neo4j AuraDB to inspect the decision timeline.")
         else:
             try:
-                timeline_result = decisions.list_decisions(neo4j_mgr)
+                timeline_result = decisions.list_decisions(neo4j_mgr, limit=50)
                 if not timeline_result.success:
-                    st.error(f"Error loading timeline: {timeline_result.error.message if timeline_result.error else 'Unknown error'}")
+                    if timeline_result.error and timeline_result.error.code == "NO_RESULTS":
+                        st.info("No decisions recorded in knowledge graph yet. Run ingestion to view timeline.")
+                    else:
+                        st.error(f"Error loading timeline: {timeline_result.error.message if timeline_result.error else 'Unknown error'}")
                 elif timeline_result.items:
                     for item in timeline_result.items:
                         d = item.get("d") or {}
                         newer = item.get("newer")
-                        title = d.get("title", "Untitled Decision")
-                        dec_type = d.get("decision_type", d.get("type", "ARCHITECTURE"))
-                        status = d.get("status", "ACTIVE")
-                        rationale = d.get("rationale", "No rationale documented.")
-                        problem = d.get("problem_context", "")
+                        title = item.get("title") or d.get("title", "Untitled Decision")
+                        dec_type = item.get("decision_type", "ARCHITECTURE")
+                        is_superseded = item.get("is_superseded", False)
+                        rationale = item.get("rationale") or d.get("rationale", "No rationale documented.")
+                        problem = item.get("problem_context") or d.get("problem_context", "")
 
-                        is_superseded = status == "SUPERSEDED" or bool(newer)
                         badge = "⚠️ SUPERSEDED" if is_superseded else "✅ ACTIVE"
                         expander_title = f"{title} [{dec_type}] — {badge}"
 
                         with st.expander(expander_title):
-                            st.write(f"**Decision ID:** `{d.get('id', 'N/A')}`")
+                            st.write(f"**Decision ID:** `{item.get('id', 'N/A')}`")
                             if problem:
                                 st.write(f"**Problem Context:** {problem}")
                             st.write(f"**Rationale:** {rationale}")
                             if is_superseded and newer:
-                                st.warning(f"This decision was superseded by: **{newer.get('title', newer.get('id', ''))}**")
+                                newer_title = newer.get("title", newer.get("id", "")) if isinstance(newer, dict) else str(newer)
+                                st.warning(f"This decision was superseded by: **{newer_title}**")
                 else:
                     st.info("No decisions recorded in knowledge graph yet. Run ingestion to view timeline.")
             except Exception as e:
