@@ -24,28 +24,21 @@ You are a senior software architect and code historian answering 'why is the cod
 Your goal is to explain why specific architectural decisions, configurations, and patterns were chosen, using ONLY the provided knowledge graph evidence.
 
 Strict Rules:
-1. Every claim MUST be grounded in the provided context (cite specific PRs, commits, issues, ADRs, or people).
+1. Every claim MUST be grounded in the provided context and cite specific candidate IDs in brackets, e.g. [PR-1234], [COMMIT-abc12345], [ISSUE-567], or [DEC-...].
 2. If a decision was superseded or reversed later, explicitly state so and explain the evolutionary arc.
 3. If the evidence is insufficient or absent in the context, do NOT invent an explanation. State: "I don't have enough evidence in the graph to answer this with certainty." Suggest who to ask based on connected contributors or where to investigate.
 4. Assign an objective confidence level:
    - HIGH: Direct primary evidence found (PR discussion, commit rationale, ADR).
    - MEDIUM: Inferred from related decisions, touched components, or partial evidence.
    - LOW: Insufficient or tangential evidence; educated conjecture.
-5. You MUST return ONLY a valid JSON object matching this schema:
+5. In "selected_evidence_ids", list ONLY the exact Canonical IDs from the candidate list that you cited/used in your answer, in order of citation.
+6. Do NOT return an "evidence" array. Evidence cards are hydrated automatically from verified database records.
+7. You MUST return ONLY a valid JSON object matching this schema:
 {
-  "answer_text": "Detailed explanation of why the code is like this...",
+  "answer_text": "Detailed explanation citing [CANONICAL-ID] markers...",
   "confidence": "HIGH" | "MEDIUM" | "LOW",
   "confidence_explanation": "Brief sentence explaining why this confidence was assigned...",
-  "evidence": [
-    {
-      "source_type": "pull_request" | "commit" | "issue" | "decision",
-      "source_id": "PR # / SHA / Issue #",
-      "title": "Title or headline of the evidence item",
-      "summary": "Key excerpt or rationale from this item",
-      "person": "Relevant developer login if known",
-      "url": "URL if available"
-    }
-  ],
+  "selected_evidence_ids": ["PR-1234", "COMMIT-abc12345"],
   "supersession": {
     "is_superseded": true | false,
     "superseded_by": "Title or ID of the newer decision",
@@ -156,7 +149,14 @@ Strict Rules:
         if self._is_placeholder or not self.client:
             return self._build_heuristic_answer(question, results, context)
 
-        prompt = f"QUESTION: {question}\n\nKNOWLEDGE GRAPH CONTEXT:\n{context}\n\nProvide the required JSON response:"
+        candidates_summary = self._format_candidates(results)
+        prompt = (
+            f"QUESTION: {question}\n\n"
+            f"CANDIDATE EVIDENCE ITEMS (cite using exact Canonical ID in brackets, e.g. [PR-123]):\n"
+            f"{candidates_summary}\n\n"
+            f"KNOWLEDGE GRAPH CONTEXT:\n{context}\n\n"
+            f"Provide the required JSON response:"
+        )
 
         # 1. Try Groq model cascade
         while self.active_model_idx < len(self.models):
@@ -185,15 +185,15 @@ Strict Rules:
                         f"Groq rate limit reached for model '{curr_model}'. "
                         f"Switching to next model in cascade."
                     )
-                    self.active_model_idx += 1
-                    if self.active_model_idx < len(self.models):
-                        logger.info(f"Active Groq model is now: '{self.models[self.active_model_idx]}'")
-                        continue
-                    else:
-                        logger.warning("All Groq models exhausted.")
-                        break
                 else:
-                    logger.warning(f"Groq API call ({curr_model}) failed: {e}")
+                    logger.warning(f"Groq API call ({curr_model}) failed or returned invalid response: {e}")
+
+                self.active_model_idx += 1
+                if self.active_model_idx < len(self.models):
+                    logger.info(f"Active Groq model is now: '{self.models[self.active_model_idx]}'")
+                    continue
+                else:
+                    logger.warning("All Groq models exhausted.")
                     break
 
         # 2. Try Google Gemini cross-provider reasoning fallback
@@ -220,10 +220,9 @@ Strict Rules:
                     gem_msg = str(gem_e).lower()
                     if "429" in gem_msg or "resource_exhausted" in gem_msg or "quota" in gem_msg:
                         logger.warning(f"Gemini fallback model '{g_model}' rate limited. Advancing to next Gemini fallback.")
-                        self.active_gemini_idx += 1
                     else:
-                        logger.warning(f"Gemini reasoning fallback with '{g_model}' failed: {gem_e}")
-                        break
+                        logger.warning(f"Gemini reasoning fallback with '{g_model}' failed or returned invalid response: {gem_e}")
+                    self.active_gemini_idx += 1
 
         # 3. If ALL models (Groq + Gemini) are exhausted, trigger rate limit cooldown!
         all_groq_exhausted = self.active_model_idx >= len(self.models)
@@ -249,7 +248,24 @@ Strict Rules:
             )
         return ans
 
-
+    def _format_candidates(self, results: list) -> str:
+        """Formats canonical candidate IDs and titles for LLM evidence selection."""
+        candidates = []
+        for res in results:
+            dec = res.get("decision", {})
+            if isinstance(dec, dict) and dec.get("id"):
+                candidates.append(f"- [{dec['id']}] Decision: {dec.get('title', 'Untitled')}")
+            for pr in res.get("pull_requests", []):
+                if isinstance(pr, dict) and pr.get("number"):
+                    candidates.append(f"- [PR-{pr['number']}] Pull Request: {pr.get('title', '')}")
+            for c in res.get("commits", []):
+                if isinstance(c, dict) and c.get("sha") and c.get("message") and c.get("date"):
+                    headline = c.get("message", "").splitlines()[0]
+                    candidates.append(f"- [COMMIT-{c['sha'][:8]}] Commit: {headline}")
+            for i in res.get("issues", []):
+                if isinstance(i, dict) and i.get("number"):
+                    candidates.append(f"- [ISSUE-{i['number']}] Issue: {i.get('title', '')}")
+        return "\n".join(candidates) if candidates else "None"
 
     def _build_insufficient_evidence_answer(self, question: str) -> Answer:
         """Default response when no evidence exists in the graph."""
@@ -261,6 +277,7 @@ Strict Rules:
             ),
             confidence=Confidence.LOW,
             confidence_explanation="Refused to invent an answer because the knowledge graph contains no matching decisions.",
+            selected_evidence_ids=[],
             evidence=[],
             supersession=None,
             ask_person=None,
@@ -269,6 +286,37 @@ Strict Rules:
 
     def _build_heuristic_answer(self, question: str, results: list, context: str) -> Answer:
         """Synthesizes an answer directly from graph traversal records when LLM API call is pending."""
+        if not results:
+            return self._build_insufficient_evidence_answer(question)
+
+        # Select top candidates by retrieval score
+        selected_candidates: list[str] = []
+        for res in results:
+            dec = res.get("decision", {})
+            if isinstance(dec, dict) and dec.get("id"):
+                cid = dec["id"]
+                if cid not in selected_candidates:
+                    selected_candidates.append(cid)
+            for pr in res.get("pull_requests", []):
+                if isinstance(pr, dict) and pr.get("number"):
+                    cid = f"PR-{pr['number']}"
+                    if cid not in selected_candidates:
+                        selected_candidates.append(cid)
+            for c in res.get("commits", []):
+                if isinstance(c, dict) and c.get("sha") and c.get("message") and c.get("date"):
+                    cid = f"COMMIT-{c['sha'][:8]}"
+                    if cid not in selected_candidates:
+                        selected_candidates.append(cid)
+            for i in res.get("issues", []):
+                if isinstance(i, dict) and i.get("number"):
+                    cid = f"ISSUE-{i['number']}"
+                    if cid not in selected_candidates:
+                        selected_candidates.append(cid)
+            if len(selected_candidates) >= 3:
+                break
+
+        top_candidates = selected_candidates[:3]
+
         top_res = results[0]
         decision = top_res.get("decision", {})
         if not isinstance(decision, dict):
@@ -286,20 +334,6 @@ Strict Rules:
             if isinstance(p, dict)
         ]
         author = people[0] if people else None
-
-        evidence_items = []
-        for pr in top_res.get("pull_requests", []):
-            if isinstance(pr, dict):
-                evidence_items.append(
-                    EvidenceItem(
-                        source_type="pull_request",
-                        source_id=str(pr.get("number", "")),
-                        title=pr.get("title", ""),
-                        summary="PR Discussion regarding this architectural choice",
-                        url=pr.get("url"),
-                        person=author,
-                    )
-                )
 
         sup_info = None
         if is_superseded:
@@ -319,72 +353,95 @@ Strict Rules:
         if is_superseded:
             answer_text += f"\n⚠️ **Note**: This decision was subsequently superseded."
 
-        return Answer(
+        ans = Answer(
             question=question,
             answer_text=answer_text,
             confidence=Confidence.MEDIUM if results else Confidence.LOW,
             confidence_explanation="Synthesized directly from verified knowledge graph nodes and relationships.",
-            evidence=evidence_items,
+            selected_evidence_ids=top_candidates,
+            evidence=[],
             supersession=sup_info,
             ask_person=author,
             related_decisions=[decision.get("id")] if decision.get("id") else [],
         )
+        ans.is_heuristic = True
+        return ans
 
     def _parse_response(self, response_text: str, retrieval_results: list, question: str) -> Answer:
-        """Parses structured JSON response into an Answer model."""
-        try:
-            text = response_text.strip()
-            if text.startswith("```json"):
-                text = text[7:]
-            elif text.startswith("```"):
-                text = text[3:]
-            if text.endswith("```"):
-                text = text[:-3]
-            text = text.strip()
+        """Parses structured JSON response into an Answer model. Raises on missing/malformed selected_evidence_ids."""
+        text = response_text.strip()
+        if text.startswith("```json"):
+            text = text[7:]
+        elif text.startswith("```"):
+            text = text[3:]
+        if text.endswith("```"):
+            text = text[:-3]
+        text = text.strip()
 
-            data = json.loads(text)
+        data = json.loads(text)
 
-            evidence_items = []
-            for item in data.get("evidence", []):
-                evidence_items.append(
-                    EvidenceItem(
-                        source_type=item.get("source_type", "decision"),
-                        source_id=str(item.get("source_id", "")),
-                        title=item.get("title", ""),
-                        summary=item.get("summary", ""),
-                        person=item.get("person"),
-                        url=item.get("url"),
-                    )
-                )
+        # Requirement: selected_evidence_ids validation
+        selected_evidence_ids = data.get("selected_evidence_ids")
+        if selected_evidence_ids is None or not isinstance(selected_evidence_ids, list):
+            raise ValueError("LLM response missing or malformed 'selected_evidence_ids' list")
 
-            sup_data = data.get("supersession")
-            supersession = None
-            if sup_data and isinstance(sup_data, dict) and sup_data.get("is_superseded"):
-                supersession = SupersessionInfo(
-                    superseded_decision=sup_data.get("superseded_decision", "Previous decision"),
-                    superseded_by=sup_data.get("superseded_by", "Newer decision"),
-                    reason=sup_data.get("reason", "Overridden by subsequent policy or refactor"),
-                )
+        selected_ids = [str(x).strip() for x in selected_evidence_ids if str(x).strip()]
 
-            conf_str = str(data.get("confidence", "MEDIUM")).upper()
-            if "HIGH" in conf_str:
-                confidence = Confidence.HIGH
-            elif "LOW" in conf_str:
-                confidence = Confidence.LOW
-            else:
-                confidence = Confidence.MEDIUM
+        # Collect valid candidate IDs strictly from retrieval results
+        valid_cids = set()
+        for r in retrieval_results:
+            dec = r.get("decision", {})
+            if isinstance(dec, dict) and dec.get("id"):
+                valid_cids.add(dec["id"].upper())
+            for pr in r.get("pull_requests", []):
+                if isinstance(pr, dict) and pr.get("number"):
+                    num = str(pr["number"])
+                    valid_cids.update([f"PR-{num}".upper(), f"PR-#{num}".upper(), f"PR #{num}".upper(), num])
+            for c in r.get("commits", []):
+                if isinstance(c, dict) and c.get("sha") and c.get("message") and c.get("date"):
+                    full_sha = str(c["sha"]).strip().upper()
+                    short_sha = full_sha[:8]
+                    valid_cids.update([f"COMMIT-{short_sha}".upper(), f"COMMIT-{full_sha}".upper(), full_sha, short_sha])
+            for iss in r.get("issues", []):
+                if isinstance(iss, dict) and iss.get("number"):
+                    num = str(iss["number"])
+                    valid_cids.update([f"ISSUE-{num}".upper(), f"ISSUE-#{num}".upper(), f"ISSUE #{num}".upper(), num])
 
-            return Answer(
-                question=question,
-                answer_text=data.get("answer_text", "No detailed answer generated."),
-                confidence=confidence,
-                confidence_explanation=data.get("confidence_explanation", "Evaluated from graph provenance."),
-                evidence=evidence_items,
-                supersession=supersession,
-                ask_person=data.get("ask_person"),
-                related_decisions=data.get("related_decisions", []),
+        resolved_ids = [cid for cid in selected_ids if cid.upper() in valid_cids]
+
+        # An empty or invalid selected_evidence_ids when candidates exist counts as a failed response:
+        # cascade to the next model.
+        if valid_cids:
+            if not selected_ids:
+                raise ValueError("LLM response returned empty 'selected_evidence_ids' despite available candidates")
+            if not resolved_ids:
+                raise ValueError("LLM response returned zero valid candidate IDs in 'selected_evidence_ids'")
+
+        sup_data = data.get("supersession")
+        supersession = None
+        if sup_data and isinstance(sup_data, dict) and sup_data.get("is_superseded"):
+            supersession = SupersessionInfo(
+                superseded_decision=sup_data.get("superseded_decision", "Previous decision"),
+                superseded_by=sup_data.get("superseded_by", "Newer decision"),
+                reason=sup_data.get("reason", "Overridden by subsequent policy or refactor"),
             )
 
-        except Exception as e:
-            logger.warning(f"Failed to parse LLM JSON response: {e}. Falling back to graph summary.")
-            return self._build_heuristic_answer(question, retrieval_results, "")
+        conf_str = str(data.get("confidence", "MEDIUM")).upper()
+        if "HIGH" in conf_str:
+            confidence = Confidence.HIGH
+        elif "LOW" in conf_str:
+            confidence = Confidence.LOW
+        else:
+            confidence = Confidence.MEDIUM
+
+        return Answer(
+            question=question,
+            answer_text=data.get("answer_text", "No detailed answer generated."),
+            confidence=confidence,
+            confidence_explanation=data.get("confidence_explanation", "Evaluated from graph provenance."),
+            selected_evidence_ids=selected_ids,
+            evidence=[],  # Evidence cards are hydrated exclusively from verified database records
+            supersession=supersession,
+            ask_person=data.get("ask_person"),
+            related_decisions=data.get("related_decisions", []),
+        )
