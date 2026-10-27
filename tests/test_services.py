@@ -328,131 +328,302 @@ def test_get_decision_graph_full_neighborhood_and_hidden_count():
 
 
 # ─────────────────────────────────────────────────────────────
-# 4. Ask Evidence Date Join & Related Decisions Filtering
+# 4. Ask Evidence Provenance, Catalog Hydration, & Marker Rewriting
 # ─────────────────────────────────────────────────────────────
 
 
-def test_ask_evidence_dates_and_filtered_related_decisions():
-    """Verify related_decisions filtered to context and evidence dates joined exactly."""
+def _load_captured_fixture():
+    import json
+    from pathlib import Path
+    fixture_path = Path(__file__).resolve().parent / "fixtures" / "retrieval_results.json"
+    with open(fixture_path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def test_ask_candidate_hydration_from_captured_fixture():
+    """Verify candidate catalog hydrates cards strictly from database fields."""
+    fixture = _load_captured_fixture()
+    catalog, alias_map = ask._build_candidate_catalog(fixture, target_repo="psf/requests")
+
+    # Verify PR-7379
+    assert "PR-7379" in catalog
+    pr_item = catalog["PR-7379"]
+    assert pr_item.source_type == "pull_request"
+    assert pr_item.source_id == "7379"
+    assert "clarify timeout parameter" in pr_item.title
+    assert pr_item.url == "https://github.com/psf/requests/pull/7379"
+    assert pr_item.date == "2026-04-20T19:29:26Z"
+    assert pr_item.person is None  # Author = None where not stored
+
+    # Verify DEC-PR-7379
+    assert "DEC-PR-7379" in catalog
+    dec_item = catalog["DEC-PR-7379"]
+    assert dec_item.source_type == "decision"
+    assert dec_item.source_id == "DEC-PR-7379"
+    assert "timeout" in dec_item.title.lower()
+    assert dec_item.url == "https://github.com/psf/requests/pull/7379"
+    assert dec_item.date == "2026-04-20T19:29:26Z"
+    assert dec_item.person == "Bojun-Vvibe"  # Linked person from people list
+
+    # Verify ISSUE-6730
+    assert "ISSUE-6730" in catalog
+    issue_item = catalog["ISSUE-6730"]
+    assert issue_item.source_type == "issue"
+    assert issue_item.source_id == "6730"
+    assert issue_item.url == "https://github.com/psf/requests/issues/6730"
+    assert issue_item.date == "2024-05-31T10:26:46Z"
+    assert issue_item.person is None
+
+
+def test_ask_unknown_evidence_id_dropped():
+    """Verify unknown or unverified IDs are discarded from evidence."""
+    fixture = _load_captured_fixture()
     mock_mgr = MagicMock()
     mock_engine = MagicMock()
     mock_retriever = MagicMock()
-
-    retrieval_fixture = [
-        {
-            "decision": {"id": "DEC-42", "title": "Use Starlette"},
-            "pull_requests": [
-                {"number": 101, "title": "Starlette PR", "created_at": "2023-01-15T10:00:00Z"}
-            ],
-            "commits": [
-                {"sha": "a1b2c3d4e5f6789012345678901234567890abcd", "date": "2023-01-16T12:00:00Z"}
-            ],
-            "issues": [
-                {"number": 55, "title": "ASGI Issue", "created_at": "2023-01-14T08:00:00Z"}
-            ],
-        }
-    ]
-    mock_retriever.retrieve.return_value = retrieval_fixture
-    mock_engine.retriever = mock_retriever
-    mock_engine.current_model = "groq/openai/gpt-oss-120b"
-    mock_engine.active_model_idx = 0
-    mock_engine.active_gemini_idx = 0
-    mock_engine.all_models_exhausted = False
-    mock_engine._is_placeholder = False
-
-    raw_answer = Answer(
-        question="Why Starlette?",
-        answer_text="Because ASGI support was necessary.",
-        confidence=Confidence.HIGH,
-        # LLM suggests valid DEC-42 AND hallucinated DEC-999
-        related_decisions=["DEC-42", "DEC-999-HALLUCINATED"],
-        evidence=[
-            EvidenceItem(
-                source_type="pull_request",
-                source_id="101",
-                title="PR 101",
-                summary="PR Discussion",
-            ),
-            # Evidence with short SHA prefix (7 chars)
-            EvidenceItem(
-                source_type="commit",
-                source_id="a1b2c3d",
-                title="Commit",
-                summary="Implementation",
-            ),
-            EvidenceItem(
-                source_type="issue",
-                source_id="55",
-                title="Issue 55",
-                summary="Initial Issue",
-            ),
-            EvidenceItem(
-                source_type="pull_request",
-                source_id="9999",  # Not in context
-                title="Unmatched PR",
-                summary="Ghost PR",
-            ),
-        ],
-    )
-    mock_engine.answer.return_value = raw_answer
-
-    result = ask.answer("Why Starlette?", mock_mgr, answer_engine=mock_engine)
-
-    assert result.success is True
-    assert result.error is None
-    assert result.model_used == "groq/openai/gpt-oss-120b"
-    assert result.degraded is False
-
-    ans = result.answer
-    assert ans is not None
-
-    # Verify hallucinated decision was filtered out
-    assert ans.related_decisions == ["DEC-42"]
-
-    # Verify exact date join (including normalized prefix match for commit)
-    ev_map = {f"{e.source_type}:{e.source_id}": e for e in ans.evidence}
-    assert ev_map["pull_request:101"].date == "2023-01-15T10:00:00Z"
-    assert ev_map["commit:a1b2c3d"].date == "2023-01-16T12:00:00Z"
-    assert ev_map["issue:55"].date == "2023-01-14T08:00:00Z"
-    assert ev_map["pull_request:9999"].date is None  # Unmatched -> None
-
-
-def test_ask_commit_date_ambiguous_prefix_returns_none():
-    """Verify ambiguous commit SHA prefix matching 2+ commits returns None."""
-    mock_mgr = MagicMock()
-    mock_engine = MagicMock()
-    mock_retriever = MagicMock()
-
-    retrieval_fixture = [
-        {
-            "decision": {"id": "DEC-1"},
-            "commits": [
-                {"sha": "a1b2c3d4_one", "date": "2023-01-01T00:00:00Z"},
-                {"sha": "a1b2c3d4_two", "date": "2023-02-02T00:00:00Z"},
-            ],
-        }
-    ]
-    mock_retriever.retrieve.return_value = retrieval_fixture
+    mock_retriever.retrieve.return_value = fixture
     mock_engine.retriever = mock_retriever
     mock_engine.current_model = "test-model"
-    mock_engine.all_models_exhausted = False
-    mock_engine._is_placeholder = False
 
     raw_answer = Answer(
-        question="Why?",
-        answer_text="Test",
-        evidence=[
-            EvidenceItem(
-                source_type="commit",
-                source_id="a1b2c3d4",  # Matches BOTH commits above!
-                title="Ambiguous Commit",
-            )
-        ],
+        question="Why timeout?",
+        answer_text="Explained in [PR-7379] and [UNKNOWN-9999].",
+        confidence=Confidence.MEDIUM,
+        selected_evidence_ids=["PR-7379", "UNKNOWN-9999"],
     )
     mock_engine.answer.return_value = raw_answer
 
-    result = ask.answer("Why?", mock_mgr, answer_engine=mock_engine)
+    result = ask.answer("Why timeout?", mock_mgr, answer_engine=mock_engine)
 
     assert result.success is True
-    # Ambiguous prefix must evaluate to None
-    assert result.answer.evidence[0].date is None
+    # UNKNOWN-9999 must be dropped
+    assert len(result.answer.evidence) == 1
+    assert result.answer.evidence[0].source_id == "7379"
+    assert result.answer.selected_evidence_ids == ["PR-7379"]
+
+
+def test_ask_duplicate_evidence_id_deduped():
+    """Verify duplicate candidate IDs are deduplicated preserving order."""
+    fixture = _load_captured_fixture()
+    mock_mgr = MagicMock()
+    mock_engine = MagicMock()
+    mock_retriever = MagicMock()
+    mock_retriever.retrieve.return_value = fixture
+    mock_engine.retriever = mock_retriever
+
+    raw_answer = Answer(
+        question="Why timeout?",
+        answer_text="Explained in [PR-7379].",
+        confidence=Confidence.MEDIUM,
+        selected_evidence_ids=["PR-7379", "PR-7379", "PR-#7379"],
+    )
+    mock_engine.answer.return_value = raw_answer
+
+    result = ask.answer("Why timeout?", mock_mgr, answer_engine=mock_engine)
+
+    assert result.success is True
+    assert len(result.answer.evidence) == 1
+    assert result.answer.evidence[0].source_id == "7379"
+
+
+def test_ask_order_determinism():
+    """Verify same retrieval context with different LLM ordering yields same card contents in requested order."""
+    fixture = _load_captured_fixture()
+    mock_mgr = MagicMock()
+    mock_engine = MagicMock()
+    mock_retriever = MagicMock()
+    mock_retriever.retrieve.return_value = fixture
+    mock_engine.retriever = mock_retriever
+
+    # Order A: PR-7379 then ISSUE-6730
+    mock_engine.answer.return_value = Answer(
+        question="Why timeout?",
+        answer_text="Answer A",
+        confidence=Confidence.HIGH,
+        selected_evidence_ids=["PR-7379", "ISSUE-6730"],
+    )
+    res_a = ask.answer("Why timeout?", mock_mgr, answer_engine=mock_engine)
+
+    # Order B: ISSUE-6730 then PR-7379
+    mock_engine.answer.return_value = Answer(
+        question="Why timeout?",
+        answer_text="Answer B",
+        confidence=Confidence.HIGH,
+        selected_evidence_ids=["ISSUE-6730", "PR-7379"],
+    )
+    res_b = ask.answer("Why timeout?", mock_mgr, answer_engine=mock_engine)
+
+    # Identical contents, reordered matching selection
+    assert res_a.answer.evidence[0].source_id == "7379"
+    assert res_a.answer.evidence[1].source_id == "6730"
+
+    assert res_b.answer.evidence[0].source_id == "6730"
+    assert res_b.answer.evidence[1].source_id == "7379"
+
+    # Card fields match exactly
+    assert res_a.answer.evidence[0].title == res_b.answer.evidence[1].title
+    assert res_a.answer.evidence[0].url == res_b.answer.evidence[1].url
+    assert res_a.answer.evidence[1].title == res_b.answer.evidence[0].title
+
+
+def test_ask_marker_rewriting_rules():
+    """
+    Verify marker rewriting:
+    - [A, B] -> [1, 2]
+    - Adjacent [A][B] -> [1][2]
+    - Unverified markers stripped
+    - Never add evidence because a marker named it
+    """
+    fixture = _load_captured_fixture()
+    mock_mgr = MagicMock()
+    mock_engine = MagicMock()
+    mock_retriever = MagicMock()
+    mock_retriever.retrieve.return_value = fixture
+    mock_engine.retriever = mock_retriever
+
+    text = (
+        "Multi-cite [PR-7379, ISSUE-6730]. "
+        "Adjacent cite [PR-7379][ISSUE-6730]. "
+        "Partial unverified [PR-7379, UNKNOWN-999]. "
+        "Ghost marker [PHANTOM-404]. "
+        "Unselected DB candidate [DEC-PR-7379]. "
+        "Preserved text [Note]."
+    )
+    mock_engine.answer.return_value = Answer(
+        question="Why timeout?",
+        answer_text=text,
+        confidence=Confidence.HIGH,
+        selected_evidence_ids=["PR-7379", "ISSUE-6730"],
+    )
+
+    res = ask.answer("Why timeout?", mock_mgr, answer_engine=mock_engine)
+    rewritten = res.answer.answer_text
+
+    # [PR-7379, ISSUE-6730] -> [1, 2]
+    assert "Multi-cite [1, 2]." in rewritten
+    # [PR-7379][ISSUE-6730] -> [1][2]
+    assert "Adjacent cite [1][2]." in rewritten
+    # [PR-7379, UNKNOWN-999] -> [1]
+    assert "Partial unverified [1]." in rewritten
+    # Ghost marker [PHANTOM-404] stripped
+    assert "[PHANTOM" not in rewritten
+    # Unselected DB candidate [DEC-PR-7379] stripped (and NEVER added to evidence!)
+    assert "[DEC-PR-7379]" not in rewritten
+    assert len(res.answer.evidence) == 2
+    assert {e.source_id for e in res.answer.evidence} == {"7379", "6730"}
+    # Non-citation text [Note] preserved
+    assert "[Note]" in rewritten
+
+
+def test_ask_confidence_capping():
+    """Verify confidence capping rules."""
+    fixture = _load_captured_fixture()
+    mock_mgr = MagicMock()
+    mock_engine = MagicMock()
+    mock_retriever = MagicMock()
+    mock_retriever.retrieve.return_value = fixture
+    mock_engine.retriever = mock_retriever
+    mock_engine._build_insufficient_evidence_answer.return_value = Answer(
+        question="Why?",
+        answer_text="No evidence found.",
+        confidence=Confidence.LOW,
+    )
+
+    # 1. Zero verified evidence: LOW confidence, NO_RESULTS error
+    mock_engine.answer.return_value = Answer(
+        question="Why?",
+        answer_text="Some text",
+        confidence=Confidence.HIGH,
+        selected_evidence_ids=["NONEXISTENT-1"],
+    )
+    res_zero = ask.answer("Why?", mock_mgr, answer_engine=mock_engine)
+    assert res_zero.success is False
+    assert res_zero.error.code == ErrorCode.NO_RESULTS
+    assert res_zero.answer.confidence == Confidence.LOW
+    assert "No evidence found" in res_zero.answer.answer_text
+
+    # 2. 1 item (even if PR): capped at MEDIUM
+    mock_engine.answer.return_value = Answer(
+        question="Why?",
+        answer_text="One PR cite [PR-7379].",
+        confidence=Confidence.HIGH,
+        selected_evidence_ids=["PR-7379"],
+    )
+    res_one = ask.answer("Why?", mock_mgr, answer_engine=mock_engine)
+    assert res_one.success is True
+    assert res_one.answer.confidence == Confidence.MEDIUM
+    assert "Confidence capped at MEDIUM" in res_one.answer.confidence_explanation
+
+    # 3. 2 items without PR or commit (e.g. 1 issue + 1 decision from issue): capped at MEDIUM
+    mock_engine.answer.return_value = Answer(
+        question="Why?",
+        answer_text="Citing issue and issue-based decision [ISSUE-6730, DEC-ISSUE-6730].",
+        confidence=Confidence.HIGH,
+        selected_evidence_ids=["ISSUE-6730", "DEC-ISSUE-6730"],
+    )
+    res_no_pr = ask.answer("Why?", mock_mgr, answer_engine=mock_engine)
+    assert res_no_pr.success is True
+    assert res_no_pr.answer.confidence == Confidence.MEDIUM
+
+    # 4. >=2 items including at least one PR or commit: HIGH preserved
+    mock_engine.answer.return_value = Answer(
+        question="Why?",
+        answer_text="Citing PR and issue [PR-7379, ISSUE-6730].",
+        confidence=Confidence.HIGH,
+        selected_evidence_ids=["PR-7379", "ISSUE-6730"],
+    )
+    res_high = ask.answer("Why?", mock_mgr, answer_engine=mock_engine)
+    assert res_high.success is True
+    assert res_high.answer.confidence == Confidence.HIGH
+
+
+def test_ask_url_collapsing_and_decision_source_credit():
+    """
+    Verify:
+    1. Cards that resolve to the same source URL are collapsed (keep the first).
+    2. Decision source is credited as PR/commit for HIGH confidence cap.
+    3. Commits lacking message or date are excluded.
+    """
+    fixture = _load_captured_fixture()
+    mock_mgr = MagicMock()
+    mock_engine = MagicMock()
+    mock_retriever = MagicMock()
+    mock_retriever.retrieve.return_value = fixture
+    mock_engine.retriever = mock_retriever
+
+    # 1. Candidate catalog excludes commit stubs without message/date
+    catalog, _ = ask._build_candidate_catalog(fixture, target_repo="psf/requests")
+    # Fixture commits only have sha (no message/date), so none should be in catalog
+    assert not any(k.startswith("COMMIT-") for k in catalog.keys())
+
+    # 2. Both DEC-PR-7379 and PR-7379 resolve to the same URL (https://github.com/psf/requests/pull/7379)
+    # When both are selected, PR-7379 collapses into DEC-PR-7379
+    mock_engine.answer.return_value = Answer(
+        question="Why timeout?",
+        answer_text="Explained in [DEC-PR-7379, PR-7379].",
+        confidence=Confidence.HIGH,
+        selected_evidence_ids=["DEC-PR-7379", "PR-7379"],
+    )
+    res = ask.answer("Why timeout?", mock_mgr, answer_engine=mock_engine)
+    assert res.success is True
+    # PR-7379 collapsed, so only 1 card remains
+    assert len(res.answer.evidence) == 1
+    assert res.answer.evidence[0].source_id == "DEC-PR-7379"
+    # Both markers rewritten to [1]
+    assert "[1]" in res.answer.answer_text
+    assert "[2]" not in res.answer.answer_text
+    # 1 distinct source URL -> confidence capped at MEDIUM
+    assert res.answer.confidence == Confidence.MEDIUM
+
+    # 3. Decision card DEC-PR-7379 counts as a verified PR towards HIGH confidence
+    # Combined with ISSUE-6730 (2 distinct sources, 1 is PR from decision) -> HIGH preserved
+    mock_engine.answer.return_value = Answer(
+        question="Why timeout?",
+        answer_text="Explained in [DEC-PR-7379, ISSUE-6730].",
+        confidence=Confidence.HIGH,
+        selected_evidence_ids=["DEC-PR-7379", "ISSUE-6730"],
+    )
+    res2 = ask.answer("Why timeout?", mock_mgr, answer_engine=mock_engine)
+    assert res2.success is True
+    assert len(res2.answer.evidence) == 2
+    assert res2.answer.confidence == Confidence.HIGH

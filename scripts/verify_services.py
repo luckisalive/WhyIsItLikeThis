@@ -22,6 +22,7 @@ from settings import get_settings
 from src.graph.neo4j_manager import Neo4jManager
 from src.services import ask, decisions, graph, stats
 from src.services.decisions import DECISION_COUNT_QUERY
+from src.services.types import ErrorCode
 
 
 def is_iso_or_none(val) -> bool:
@@ -38,11 +39,10 @@ def is_iso_or_none(val) -> bool:
 
 
 def main():
-    if sys.stdout.encoding != 'utf-8':
-        try:
-            sys.stdout.reconfigure(encoding='utf-8')
-        except Exception:
-            pass
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', line_buffering=True)
+    except Exception:
+        pass
 
     print("=" * 70)
     print("SERVICE LAYER VERIFICATION SUITE")
@@ -271,72 +271,102 @@ def main():
             all_passed = False
 
     # ─────────────────────────────────────────────────────────
-    # Invariant 6: Real ask() call evidence date ISO or None
+    # Invariant 6: Real ask() evaluation: 3 questions x 5 runs (15 total runs)
     # ─────────────────────────────────────────────────────────
-    print("--- [Invariant 6] Evidence date format on real ask() call ---")
-    test_question = "Why does requests use urllib3?"
-    print(f"Calling ask.answer('{test_question}')...")
-    ask_res = ask.answer(test_question, neo4j_mgr, settings=settings)
+    PAUSE_BETWEEN_RUNS = 1.0  # Configurable pause in seconds
 
-    if not ask_res.answer or not ask_res.answer.evidence:
-        print("No evidence items returned by ask.answer.")
-        inv6_pass = False
+    print("--- [Invariant 6] Strict Evidence Provenance: 3 questions x 5 runs (15 total runs) ---")
+    print(f"Configured pause between runs: {PAUSE_BETWEEN_RUNS}s")
+    test_questions = [
+        "Why does requests use urllib3?",
+        "Why was default timeout not set in requests?",
+        "Why was chardet replaced or made optional?",
+    ]
+
+    RUNS_PER_QUESTION = 5
+    inv6_passed = True
+
+    total_cards_collected = 0
+    cards_with_url_and_date = 0
+    decision_cards_total = 0
+    decision_cards_unresolved_url = 0
+
+    all_card_counts_by_type: dict[str, int] = {}
+
+    import time
+
+    for q_idx, q in enumerate(test_questions, 1):
+        print(f"\n{'='*60}\n[Question {q_idx}] \"{q}\"\n{'='*60}")
+        q_successes = 0
+        q_no_results = 0
+        q_inconclusive = 0
+        q_card_counts: dict[str, int] = {}
+
+        for run_idx in range(1, RUNS_PER_QUESTION + 1):
+            if PAUSE_BETWEEN_RUNS > 0:
+                time.sleep(PAUSE_BETWEEN_RUNS)
+
+            ask_res = ask.answer(q, neo4j_mgr, settings=settings)
+
+            err_str = f"{ask_res.error.code}: {ask_res.error.message}" if ask_res.error else "None"
+            print(f"  Run {run_idx}/{RUNS_PER_QUESTION}: model={ask_res.model_used}, degraded={ask_res.degraded}, error={err_str}")
+
+            if ask_res.error:
+                if ask_res.error.code == ErrorCode.LLM_UNAVAILABLE:
+                    q_inconclusive += 1
+                    print("    Status: INCONCLUSIVE (LLM_UNAVAILABLE)")
+                elif ask_res.error.code == ErrorCode.NO_RESULTS:
+                    q_no_results += 1
+            else:
+                q_successes += 1
+
+            evidence_items = ask_res.answer.evidence if (ask_res.answer and ask_res.answer.evidence) else []
+            for ev in evidence_items:
+                total_cards_collected += 1
+                stype = ev.source_type.lower()
+                all_card_counts_by_type[stype] = all_card_counts_by_type.get(stype, 0) + 1
+                q_card_counts[stype] = q_card_counts.get(stype, 0) + 1
+
+                has_url = bool(ev.url)
+                has_iso_date = bool(ev.date) and is_iso_or_none(ev.date)
+
+                if stype == "decision":
+                    decision_cards_total += 1
+                    if not has_url:
+                        decision_cards_unresolved_url += 1
+
+                if has_url and has_iso_date:
+                    cards_with_url_and_date += 1
+
+        print(f"\n  Question {q_idx} Summary:")
+        print(f"    Success rate : {q_successes}/{RUNS_PER_QUESTION} ({(q_successes/RUNS_PER_QUESTION)*100:.1f}%)")
+        print(f"    NO_RESULTS   : {q_no_results}/{RUNS_PER_QUESTION}")
+        print(f"    Card counts  : {q_card_counts}")
+
+        if q_no_results > 1:
+            print(f"    [FAIL] Question had {q_no_results} > 1 NO_RESULTS runs.")
+            inv6_passed = False
+
+    print(f"\n{'='*60}\nOVERALL EVIDENCE PROVENANCE METRICS (across all 15 runs)\n{'='*60}")
+    print(f"Total evidence cards collected: {total_cards_collected}")
+    print(f"Card counts by type           : {all_card_counts_by_type}")
+    print(f"Decision cards evaluated      : {decision_cards_total} ({decision_cards_total - decision_cards_unresolved_url} resolved url/date, {decision_cards_unresolved_url} unresolvable url=None)")
+
+    if total_cards_collected > 0:
+        ratio = cards_with_url_and_date / total_cards_collected
+        print(f"Cards with both URL & ISO date: {cards_with_url_and_date}/{total_cards_collected} ({ratio*100:.1f}%)")
+        if ratio < 0.80:
+            print(f"[FAIL] Fewer than 80% of cards have both URL and ISO date ({ratio*100:.1f}% < 80.0%).")
+            inv6_passed = False
     else:
-        commit_matches = 0
-        pr_matches = 0
-        issue_matches = 0
-        non_none_dates = 0
+        print("[FAIL] Zero evidence cards collected across all runs.")
+        inv6_passed = False
 
-        print(f"Evidence items count: {len(ask_res.answer.evidence)}")
-        for i, ev in enumerate(ask_res.answer.evidence, 1):
-            stype = ev.source_type.lower()
-            valid_date = is_iso_or_none(ev.date)
-            has_date = ev.date is not None
-            if has_date and valid_date:
-                non_none_dates += 1
-                if "commit" in stype:
-                    commit_matches += 1
-                elif "pr" in stype or "pull" in stype:
-                    pr_matches += 1
-                elif "issue" in stype:
-                    issue_matches += 1
-
-            if "commit" in stype:
-                print(f"  [COMMIT EVIDENCE] source_id: '{ev.source_id}', date: {repr(ev.date)}")
-
-            print(f"  {i}. [{ev.source_type}] {ev.source_id} -> Date: {repr(ev.date)} (Valid ISO: {valid_date})")
-
-        print(f"\nMatch Counts with Dates:")
-        print(f"  Commits with dates : {commit_matches}")
-        print(f"  PRs with dates     : {pr_matches}")
-        print(f"  Issues with dates  : {issue_matches}")
-        print(f"  Total with dates   : {non_none_dates}")
-
-        # Invariant 6: FAIL unless at least one commit/PR/issue evidence item has a non-None ISO date
-        inv6_pass = (non_none_dates >= 1)
-
-    if inv6_pass:
-        print("Result: PASS\n")
+    if inv6_passed:
+        print("\nInvariant 6 Result: PASS\n")
     else:
-        print("Result: FAIL (No evidence item has a non-None valid ISO date)\n")
+        print("\nInvariant 6 Result: FAIL\n")
         all_passed = False
-
-    # ─────────────────────────────────────────────────────────
-    # EXPERIMENT 3: Evidence Determinism (3 runs of same question)
-    # ─────────────────────────────────────────────────────────
-    print("--- [EXPERIMENT 3] Evidence Determinism (3 runs of same question) ---")
-    det_question = "Why was default timeout not set in requests?"
-    print(f"Evaluating determinism on question: '{det_question}'\n")
-    for run_idx in range(1, 4):
-        print(f"--- Run {run_idx} ---")
-        run_res = ask.answer(det_question, neo4j_mgr, settings=settings)
-        if run_res.answer and run_res.answer.evidence:
-            print(f"Evidence count: {len(run_res.answer.evidence)}")
-            for j, ev in enumerate(run_res.answer.evidence, 1):
-                print(f"  {j}. source_type={ev.source_type}, source_id={ev.source_id}, title={ev.title[:30]}..., date={ev.date}")
-        else:
-            print("  (No evidence returned or answer unavailable)")
-        print()
 
     print("=" * 70)
     print(f"OVERALL SUITE: {'ALL PASSED' if all_passed else 'SOME INVARIANTS FAILED'}")

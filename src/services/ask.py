@@ -6,12 +6,13 @@ Framework-agnostic: no Streamlit imports or session state.
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from src.graph.embedding_generator import EmbeddingGenerator
 from src.graph.neo4j_manager import Neo4jManager
-from src.models import Answer
+from src.models import Answer, Confidence, EvidenceItem
 from src.query.answer_engine import AnswerEngine
 from src.query.retriever import WhyRetriever
 from src.services.types import AskResult, ErrorCode, ServiceError
@@ -59,139 +60,250 @@ def _to_iso_string(val: Any) -> Optional[str]:
     return str(val)
 
 
-def _parse_source_ref(source_type: str, source_id: str) -> Tuple[str, str]:
+def _build_candidate_catalog(
+    retrieval_results: List[Dict[str, Any]],
+    target_repo: str = "psf/requests",
+) -> Tuple[Dict[str, EvidenceItem], Dict[str, str]]:
     """
-    Resolves evidence source_id format:
-      DEC-COMMIT-<8 chars> -> ('commit', '<sha>')
-      DEC-PR-<n>          -> ('pull_request', '<n>')
-      DEC-ISSUE-<n>       -> ('issue', '<n>')
-      COMMIT-<sha>        -> ('commit', '<sha>')
-      PR-<n> / PR #<n>    -> ('pull_request', '<n>')
-      ISSUE-<n>           -> ('issue', '<n>')
+    Builds canonical candidate lookup table and alias map strictly from database nodes.
+    - Commits lacking message or date are strictly excluded.
+    - Decision cards resolve url and date from their underlying source PR/commit/issue.
+    - Author = None where not stored
+    - Headline = first line of message
+    - Date = created_at (PR/issue) or date (commit); no merged_at
     """
-    sid = str(source_id).strip()
-    sid_upper = sid.upper()
+    catalog: Dict[str, EvidenceItem] = {}
+    alias_map: Dict[str, str] = {}
+    unresolved_decisions_count = 0
+    total_decisions_count = 0
 
-    if sid_upper.startswith("DEC-COMMIT-"):
-        return "commit", sid[11:].strip()
-    if sid_upper.startswith("DEC-PR-"):
-        return "pull_request", sid[7:].strip()
-    if sid_upper.startswith("DEC-ISSUE-"):
-        return "issue", sid[10:].strip()
+    for res in retrieval_results:
+        # 1. Decision
+        dec = res.get("decision", {})
+        if isinstance(dec, dict) and dec.get("id"):
+            total_decisions_count += 1
+            dec_id = dec["id"]
+            author = None
+            if res.get("people"):
+                p0 = res["people"][0]
+                if isinstance(p0, dict):
+                    author = p0.get("name") or p0.get("login")
+            summary = dec.get("rationale") or dec.get("decision_made") or ""
 
-    if sid_upper.startswith("COMMIT-") or sid_upper.startswith("COMMIT "):
-        return "commit", sid[7:].strip()
-    if sid_upper.startswith("PR-") or sid_upper.startswith("PR "):
-        return "pull_request", sid[3:].strip().lstrip("#").strip()
-    if sid_upper.startswith("ISSUE-") or sid_upper.startswith("ISSUE "):
-        return "issue", sid[6:].strip().lstrip("#").strip()
+            # Resolve url and date from the decision's source record
+            src_type = str(dec.get("source_type") or "").lower()
+            src_id = str(dec.get("source_id") or "").strip()
 
-    stype = source_type.lower().strip()
-    clean_id = sid.lstrip("#").strip()
-    if stype in ("c", "commit"):
-        return "commit", clean_id
-    if stype in ("pr", "pull_request", "pull"):
-        return "pull_request", clean_id
-    if stype in ("iss", "issue"):
-        return "issue", clean_id
+            dec_url = None
+            dec_date = None
+            resolved_source = None
 
-    return stype, clean_id
+            if src_type in ("pull_request", "pr"):
+                for r in retrieval_results:
+                    for pr in r.get("pull_requests", []):
+                        if isinstance(pr, dict) and str(pr.get("number")) == src_id:
+                            dec_url = pr.get("url") or f"https://github.com/{target_repo}/pull/{src_id}"
+                            dec_date = _to_iso_string(pr.get("created_at"))
+                            resolved_source = ("pull_request", src_id)
+                            break
+                    if resolved_source:
+                        break
+            elif src_type == "commit":
+                for r in retrieval_results:
+                    for c in r.get("commits", []):
+                        if isinstance(c, dict) and c.get("sha"):
+                            sha = str(c["sha"]).strip()
+                            if sha.startswith(src_id) or src_id.startswith(sha):
+                                dec_url = c.get("url") or f"https://github.com/{target_repo}/commit/{sha}"
+                                dec_date = _to_iso_string(c.get("date"))
+                                resolved_source = ("commit", sha[:8])
+                                break
+                    if resolved_source:
+                        break
+            elif src_type == "issue":
+                for r in retrieval_results:
+                    for iss in r.get("issues", []):
+                        if isinstance(iss, dict) and str(iss.get("number")) == src_id:
+                            dec_url = iss.get("url") or f"https://github.com/{target_repo}/issues/{src_id}"
+                            dec_date = _to_iso_string(iss.get("created_at"))
+                            resolved_source = ("issue", src_id)
+                            break
+                    if resolved_source:
+                        break
+
+            if not dec_url:
+                unresolved_decisions_count += 1
+
+            catalog[dec_id] = EvidenceItem(
+                source_type="decision",
+                source_id=dec_id,
+                title=dec.get("title", dec_id),
+                summary=summary,
+                url=dec_url,
+                date=dec_date,
+                person=author,
+                cited=True,
+                underlying_source=resolved_source or ("decision", dec_id),
+            )
+            alias_map[dec_id.upper()] = dec_id
+
+        # 2. Pull Requests
+        for pr in res.get("pull_requests", []):
+            if isinstance(pr, dict) and pr.get("number"):
+                num_str = str(pr["number"])
+                cid = f"PR-{num_str}"
+                title = pr.get("title") or f"PR #{num_str}"
+                summary = (pr.get("body") or "").strip()[:300]
+                url = pr.get("url") or f"https://github.com/{target_repo}/pull/{num_str}"
+                date = _to_iso_string(pr.get("created_at"))
+                catalog[cid] = EvidenceItem(
+                    source_type="pull_request",
+                    source_id=num_str,
+                    title=title,
+                    summary=summary,
+                    url=url,
+                    date=date,
+                    person=None,
+                    cited=True,
+                    underlying_source=("pull_request", num_str),
+                )
+                alias_map[cid.upper()] = cid
+                alias_map[f"PR-#{num_str}".upper()] = cid
+                alias_map[f"PR #{num_str}".upper()] = cid
+                alias_map[num_str] = cid
+
+        # 3. Commits (strictly require both message and date)
+        for c in res.get("commits", []):
+            if isinstance(c, dict) and c.get("sha") and c.get("message") and c.get("date"):
+                full_sha = str(c["sha"]).strip()
+                short_sha = full_sha[:8]
+                cid = f"COMMIT-{short_sha}"
+                msg = c.get("message", "")
+                lines = msg.splitlines() if msg else []
+                headline = lines[0] if lines else f"Commit {short_sha}"
+                body_lines = lines[1:] if len(lines) > 1 else []
+                summary = "\n".join(body_lines).strip()[:300] if body_lines else headline
+                url = c.get("url") or f"https://github.com/{target_repo}/commit/{full_sha}"
+                date = _to_iso_string(c.get("date"))
+                catalog[cid] = EvidenceItem(
+                    source_type="commit",
+                    source_id=short_sha,
+                    title=headline,
+                    summary=summary,
+                    url=url,
+                    date=date,
+                    person=None,
+                    cited=True,
+                    underlying_source=("commit", short_sha),
+                )
+                alias_map[cid.upper()] = cid
+                alias_map[f"COMMIT-{full_sha}".upper()] = cid
+                alias_map[full_sha.upper()] = cid
+                alias_map[short_sha.upper()] = cid
+
+        # 4. Issues
+        for iss in res.get("issues", []):
+            if isinstance(iss, dict) and iss.get("number"):
+                num_str = str(iss["number"])
+                cid = f"ISSUE-{num_str}"
+                title = iss.get("title") or f"Issue #{num_str}"
+                summary = (iss.get("body") or "").strip()[:300]
+                url = iss.get("url") or f"https://github.com/{target_repo}/issues/{num_str}"
+                date = _to_iso_string(iss.get("created_at"))
+                catalog[cid] = EvidenceItem(
+                    source_type="issue",
+                    source_id=num_str,
+                    title=title,
+                    summary=summary,
+                    url=url,
+                    date=date,
+                    person=None,
+                    cited=True,
+                    underlying_source=("issue", num_str),
+                )
+                alias_map[cid.upper()] = cid
+                alias_map[f"ISSUE-#{num_str}".upper()] = cid
+                alias_map[f"ISSUE #{num_str}".upper()] = cid
+                alias_map[num_str] = cid
+
+    if total_decisions_count > 0:
+        logger.debug(
+            f"Decision card hydration: {total_decisions_count - unresolved_decisions_count}/{total_decisions_count} "
+            f"resolved url/date; {unresolved_decisions_count} kept with url=None."
+        )
+
+    return catalog, alias_map
 
 
-def _resolve_evidence_date(
-    source_type: str,
-    source_id: str,
-    results: List[Dict[str, Any]],
-) -> Optional[str]:
+def _rewrite_citation_markers(
+    answer_text: str,
+    verified_evidence: List[EvidenceItem],
+    candidate_catalog: Dict[str, EvidenceItem],
+    alias_map: Dict[str, str],
+    collapsed_map: Optional[Dict[str, int]] = None,
+) -> str:
     """
-    Resolve evidence date through its decision or context items:
-      DEC-COMMIT-<sha> -> linked commit whose sha starts with it
-      DEC-PR-<n>       -> linked PR with that number
-      DEC-ISSUE-<n>    -> linked issue with that number
-    Ambiguous or missing -> None. Converts temporal values to ISO string.
+    Rewrites [CANONICAL-ID] markers to [1], [2] in final verified evidence order.
+    - Handles [A, B] and adjacent [A][B].
+    - Strips markers for candidates not in the final evidence list.
+    - Preserves mappings for cards collapsed by identical source URL.
+    - Never adds evidence because a marker named it.
     """
-    resolved_type, target_ref = _parse_source_ref(source_type, source_id)
-    if not target_ref or not results:
-        return None
+    id_to_num: Dict[str, int] = {}
+    if collapsed_map:
+        id_to_num.update(collapsed_map)
 
-    # Check commits
-    if resolved_type == "commit":
-        target_sha = target_ref.lower()
-        all_commits: List[Dict[str, Any]] = []
-        for res in results:
-            # If decision ID matches the source_id directly, check its commits first
-            dec_id = res.get("decision", {}).get("id", "")
-            if dec_id and str(source_id).strip().upper() == dec_id.upper():
-                dec_commits = res.get("commits", [])
-                if dec_commits and isinstance(dec_commits[0], dict):
-                    return _to_iso_string(dec_commits[0].get("date"))
+    for idx, ev in enumerate(verified_evidence, 1):
+        for cid, item in candidate_catalog.items():
+            if item.source_type == ev.source_type and item.source_id == ev.source_id:
+                id_to_num[cid.upper()] = idx
+                if ev.source_type == "commit":
+                    id_to_num[f"COMMIT-{ev.source_id}".upper()] = idx
+                elif ev.source_type == "pull_request":
+                    id_to_num[f"PR-{ev.source_id}".upper()] = idx
+                elif ev.source_type == "issue":
+                    id_to_num[f"ISSUE-{ev.source_id}".upper()] = idx
 
-            for c in res.get("commits", []):
-                if isinstance(c, dict) and c.get("sha"):
-                    all_commits.append(c)
+    known_candidates_upper = set(alias_map.keys())
 
-        # Match commit SHA: exact or prefix match
-        exact_matches = [c for c in all_commits if str(c.get("sha", "")).lower() == target_sha]
-        if len(exact_matches) == 1:
-            return _to_iso_string(exact_matches[0].get("date"))
+    def replace_bracket(match: re.Match) -> str:
+        content = match.group(1).strip()
+        tokens = [t.strip() for t in content.split(",") if t.strip()]
+        resolved_nums = []
+        is_citation_marker = False
 
-        prefix_matches = [c for c in all_commits if str(c.get("sha", "")).lower().startswith(target_sha)]
-        # Deduplicate commits by SHA to avoid false ambiguity
-        unique_prefix_shas = {str(c.get("sha", "")).lower(): c for c in prefix_matches}
-        if len(unique_prefix_shas) == 1:
-            return _to_iso_string(list(unique_prefix_shas.values())[0].get("date"))
-        elif len(unique_prefix_shas) > 1:
-            logger.warning(f"Ambiguous commit prefix '{target_sha}' matched {len(unique_prefix_shas)} distinct commits.")
-            return None
+        for token in tokens:
+            token_clean = token.lstrip("#").strip()
+            token_upper = token_clean.upper()
 
-        return None
+            resolved_cid = alias_map.get(token_upper) or token_upper
+            num = id_to_num.get(resolved_cid) or id_to_num.get(token_upper)
 
-    # Check Pull Requests
-    if resolved_type == "pull_request":
-        target_num = target_ref.lstrip("#").strip()
-        all_prs: List[Dict[str, Any]] = []
-        for res in results:
-            dec_id = res.get("decision", {}).get("id", "")
-            if dec_id and str(source_id).strip().upper() == dec_id.upper():
-                dec_prs = res.get("pull_requests", [])
-                if dec_prs and isinstance(dec_prs[0], dict):
-                    pr_date = dec_prs[0].get("created_at") or dec_prs[0].get("merged_at")
-                    return _to_iso_string(pr_date)
+            if num is not None:
+                is_citation_marker = True
+                if num not in resolved_nums:
+                    resolved_nums.append(num)
+            else:
+                if (
+                    token_upper in known_candidates_upper
+                    or re.match(r"^[A-Z]+-[A-Za-z0-9_\-]+$", token_upper)
+                    or re.match(r"^[0-9a-f]{7,40}$", token_clean, re.IGNORECASE)
+                ):
+                    is_citation_marker = True
 
-            for pr in res.get("pull_requests", []):
-                if isinstance(pr, dict):
-                    all_prs.append(pr)
+        if is_citation_marker:
+            if resolved_nums:
+                return f"[{', '.join(str(n) for n in resolved_nums)}]"
+            else:
+                return ""
+        else:
+            return match.group(0)
 
-        matched_prs = [pr for pr in all_prs if str(pr.get("number", "")).strip() == target_num]
-        if matched_prs:
-            pr_val = matched_prs[0]
-            pr_date = pr_val.get("created_at") or pr_val.get("merged_at")
-            return _to_iso_string(pr_date)
-
-        return None
-
-    # Check Issues
-    if resolved_type == "issue":
-        target_num = target_ref.lstrip("#").strip()
-        all_issues: List[Dict[str, Any]] = []
-        for res in results:
-            dec_id = res.get("decision", {}).get("id", "")
-            if dec_id and str(source_id).strip().upper() == dec_id.upper():
-                dec_issues = res.get("issues", [])
-                if dec_issues and isinstance(dec_issues[0], dict):
-                    return _to_iso_string(dec_issues[0].get("created_at"))
-
-            for iss in res.get("issues", []):
-                if isinstance(iss, dict):
-                    all_issues.append(iss)
-
-        matched_issues = [iss for iss in all_issues if str(iss.get("number", "")).strip() == target_num]
-        if matched_issues:
-            return _to_iso_string(matched_issues[0].get("created_at"))
-
-        return None
-
-    return None
+    rewritten = re.sub(r"\[([^\]]+)\]", replace_bracket, answer_text)
+    rewritten = re.sub(r"\[\s*\]", "", rewritten)
+    rewritten = re.sub(r" +\[", " [", rewritten)
+    rewritten = re.sub(r" +([,\.])", r"\1", rewritten)
+    return rewritten
 
 
 def answer(
@@ -202,12 +314,13 @@ def answer(
     allow_heuristic: bool = True,
 ) -> AskResult:
     """
-    Answer an architectural question using GraphRAG.
+    Answer an architectural question using GraphRAG with strict evidence provenance.
 
-    - related_decisions: retains model suggestions filtered to IDs present in retrieval context.
-    - evidence.date: resolved through linked decision / context (exact or unique-prefix); None if ambiguous/missing.
-    - model_used & degraded: tracked on AskResult.
-    - Error handling: returns DB_UNREACHABLE, NO_RESULTS, LLM_UNAVAILABLE without raising.
+    - Candidates: Canonical IDs (PR-..., COMMIT-..., ISSUE-..., DEC-...).
+    - Evidence items: Hydrated strictly from database records; never authored by LLM.
+    - Zero verified evidence: Insufficient-evidence text, LOW confidence, NO_RESULTS error.
+    - Confidence cap: HIGH requires >=2 distinct underlying sources with at least one PR or commit; else MEDIUM.
+    - Citation markers: Rewritten to [1], [2]; unresolved markers stripped.
     """
     if not neo4j_mgr:
         return AskResult(
@@ -239,7 +352,7 @@ def answer(
                 )
             )
 
-        # 1. Retrieve context to join evidence dates and validate related decisions
+        # 1. Retrieve context to establish candidate evidence items and decision context
         retriever = getattr(engine, "retriever", None)
         retrieval_results = []
         if retriever:
@@ -276,37 +389,126 @@ def answer(
                 degraded=True,
             )
 
-        # 2. Generate answer
+        # 2. Build candidate catalog strictly from database records
+        target_repo = getattr(settings, "target_repo", "psf/requests") if settings else "psf/requests"
+        candidate_catalog, alias_map = _build_candidate_catalog(retrieval_results, target_repo)
+
+        # 3. Generate answer
         ans = engine.answer(clean_question)
 
-        # 3. Filter related_decisions to IDs present in retrieval context
+        # 4. Filter related_decisions to IDs present in retrieval context
         context_decision_ids: Set[str] = {
             r["decision"]["id"]
             for r in retrieval_results
             if isinstance(r.get("decision"), dict) and r["decision"].get("id")
         }
-        filtered_related = [d_id for d_id in ans.related_decisions if d_id in context_decision_ids]
-        ans.related_decisions = filtered_related
+        ans.related_decisions = [d_id for d_id in ans.related_decisions if d_id in context_decision_ids]
 
-        # 4. Join evidence dates from retrieval context (resolving through decision / prefix match)
-        for ev in ans.evidence:
-            ev.date = _resolve_evidence_date(ev.source_type, ev.source_id, retrieval_results)
+        # 5. Hydrate verified evidence items strictly from candidate catalog (collapsing same URL)
+        verified_evidence: List[EvidenceItem] = []
+        seen_urls: Set[str] = set()
+        seen_cids: Set[str] = set()
+        collapsed_map: Dict[str, int] = {}
 
-        # 5. Determine model used and degraded status
-        all_exhausted = bool(getattr(engine, "all_models_exhausted", False))
+        raw_selected = getattr(ans, "selected_evidence_ids", []) or []
+        for raw_id in raw_selected:
+            raw_clean = str(raw_id).strip()
+            canonical_cid = alias_map.get(raw_clean.upper()) or raw_clean
+            if canonical_cid in candidate_catalog and canonical_cid not in seen_cids:
+                item = candidate_catalog[canonical_cid]
+
+                # Collapse evidence cards that resolve to the same source URL (keep the first)
+                if item.url and item.url in seen_urls:
+                    for idx, ev in enumerate(verified_evidence, 1):
+                        if ev.url == item.url:
+                            collapsed_map[canonical_cid.upper()] = idx
+                            break
+                    seen_cids.add(canonical_cid)
+                    continue
+
+                seen_cids.add(canonical_cid)
+                if item.url:
+                    seen_urls.add(item.url)
+                verified_evidence.append(item)
+                collapsed_map[canonical_cid.upper()] = len(verified_evidence)
+
+        # 6. Determine model used, fallback status, and degraded state
+        is_heuristic_fallback = (
+            getattr(ans, "is_heuristic", False) is True
+            or getattr(engine, "all_models_exhausted", False) is True
+            or getattr(engine, "_is_placeholder", False) is True
+        )
         active_idx = getattr(engine, "active_model_idx", 0)
         gemini_idx = getattr(engine, "active_gemini_idx", 0)
         try:
-            is_fallback_active = (int(active_idx) > 0 or int(gemini_idx) > 0)
+            is_fallback_active = int(active_idx) > 0 or int(gemini_idx) > 0
         except (TypeError, ValueError):
             is_fallback_active = False
 
-        if all_exhausted or getattr(engine, "_is_placeholder", False):
+        if is_heuristic_fallback:
             model_used = "heuristic_graph_synthesis"
             degraded = True
+            # Flag cards as not cited in the answer
+            for ev in verified_evidence:
+                ev.cited = False
         else:
-            model_used = getattr(engine, "current_model", "groq/openai/gpt-oss-120b")
+            raw_model = getattr(engine, "current_model", None)
+            model_used = str(raw_model) if isinstance(raw_model, str) else "groq/openai/gpt-oss-120b"
             degraded = is_fallback_active
+
+        # 7. Zero verified evidence rule: replace text with insufficient-evidence text, LOW confidence, NO_RESULTS
+        if not verified_evidence:
+            insufficient_ans = engine._build_insufficient_evidence_answer(clean_question)
+            ans.answer_text = insufficient_ans.answer_text
+            ans.confidence = Confidence.LOW
+            ans.confidence_explanation = "Refused to invent an answer because no verified evidence supported the question."
+            ans.evidence = []
+            ans.selected_evidence_ids = []
+            return AskResult(
+                answer=ans,
+                model_used=model_used,
+                degraded=degraded,
+                error=ServiceError(
+                    code=ErrorCode.NO_RESULTS,
+                    message="No verified evidence found to support the answer.",
+                ),
+            )
+
+        # 8. Confidence cap: HIGH requires >=2 distinct underlying sources with at least one PR or commit
+        distinct_sources: Set[Tuple[str, str]] = set()
+        for ev in verified_evidence:
+            if ev.underlying_source:
+                distinct_sources.add(ev.underlying_source)
+            else:
+                distinct_sources.add((ev.source_type, ev.source_id))
+
+        has_pr_or_commit = any(src[0] in ("pull_request", "commit") for src in distinct_sources)
+
+        if is_heuristic_fallback:
+            if ans.confidence == Confidence.HIGH:
+                ans.confidence = Confidence.MEDIUM
+            ans.confidence_explanation = (
+                "Direct graph retrieval fallback (confidence capped at MEDIUM; cards not cited in synthesized text)."
+            )
+        elif ans.confidence == Confidence.HIGH:
+            if len(distinct_sources) < 2 or not has_pr_or_commit:
+                ans.confidence = Confidence.MEDIUM
+                ans.confidence_explanation += (
+                    " (Confidence capped at MEDIUM: requires >=2 distinct underlying sources "
+                    "including at least one PR or commit)."
+                )
+
+        # 9. Rewrite inline citation markers and strip unresolvable markers
+        ans.answer_text = _rewrite_citation_markers(
+            ans.answer_text,
+            verified_evidence,
+            candidate_catalog,
+            alias_map,
+            collapsed_map,
+        )
+
+        ans.evidence = verified_evidence
+        ans.selected_evidence_ids = [cid for cid in raw_selected if (alias_map.get(str(cid).strip().upper()) or str(cid).strip()) in seen_cids]
 
         return AskResult(
             answer=ans,

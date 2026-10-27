@@ -232,6 +232,8 @@ class EvidenceItem(BaseModel):
     url: Optional[str] = None
     date: Optional[Any] = None
     person: Optional[str] = None
+    cited: bool = True
+    underlying_source: Optional[tuple[str, str]] = None
 
 
 class SupersessionInfo(BaseModel):
@@ -250,6 +252,9 @@ class Answer(BaseModel):
     answer_text: str = ""
     confidence: Confidence = Confidence.LOW
     confidence_explanation: str = ""
+    selected_evidence_ids: list[str] = Field(
+        default_factory=list, description="Canonical candidate IDs used in order"
+    )
     evidence: list[EvidenceItem] = Field(default_factory=list)
     supersession: Optional[SupersessionInfo] = None
     ask_person: Optional[str] = Field(
@@ -259,6 +264,7 @@ class Answer(BaseModel):
     related_decisions: list[str] = Field(
         default_factory=list, description="IDs of related decisions"
     )
+    is_heuristic: bool = False
 
 
 # ──────────────────────────────────────────────
