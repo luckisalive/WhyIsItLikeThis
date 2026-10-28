@@ -350,23 +350,44 @@ class Neo4jManager:
         except Exception as e:
             logger.error(f"Failed to link decision {decision_id}: {e}")
 
-    def mark_superseded(self, old_id: str, new_id: str, reason: str) -> None:
+    def mark_superseded(
+        self,
+        old_id: str,
+        new_id: str,
+        reason: str = "",
+        detection_type: str = "EXPLICIT",
+        rule: str = "",
+        evidence_text: str = "",
+        detected_at: Optional[str] = None,
+    ) -> None:
         """Creates SUPERSEDES edge and sets old decision status to SUPERSEDED."""
+        if not detected_at:
+            from datetime import datetime, timezone
+            detected_at = datetime.now(timezone.utc).isoformat()
+
         query = """
         MATCH (new_d:Decision {id: $new_id}), (old_d:Decision {id: $old_id})
         MERGE (new_d)-[s:SUPERSEDES]->(old_d)
         SET s.reason = $reason,
+            s.detection_type = $detection_type,
+            s.rule = $rule,
+            s.evidence_text = $evidence_text,
+            s.detected_at = $detected_at,
             old_d.status = $status
         """
         params = {
             "new_id": new_id,
             "old_id": old_id,
-            "reason": reason,
+            "reason": reason or f"Explicit {rule}: {evidence_text}".strip(),
+            "detection_type": detection_type,
+            "rule": rule,
+            "evidence_text": evidence_text,
+            "detected_at": detected_at,
             "status": DecisionStatus.SUPERSEDED.value,
         }
         try:
             self.driver.execute_query(query, params)
-            logger.info(f"Decision {new_id} SUPERSEDES {old_id} (Reason: {reason})")
+            logger.info(f"Decision {new_id} SUPERSEDES {old_id} (Type: {detection_type}, Rule: {rule})")
         except Exception as e:
             logger.error(f"Failed to mark superseded {old_id} by {new_id}: {e}")
 
