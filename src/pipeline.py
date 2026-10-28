@@ -23,8 +23,9 @@ logger = logging.getLogger(__name__)
 class IngestionPipeline:
     """End-to-end ingestion pipeline from GitHub to knowledge graph."""
 
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, enable_implicit_supersession: bool = False):
         self.settings = settings
+        self.enable_implicit_supersession = enable_implicit_supersession
         self.cache = SQLiteCache()
         self.fetcher = GitHubFetcher(settings.github_token, settings.target_repo, self.cache)
         self.collator = ContextCollator()
@@ -201,7 +202,9 @@ class IngestionPipeline:
             # Step 10: Run supersession detection
             notify("Running supersession detection...", 0.90)
             try:
-                results = self.supersession_detector.run_all()
+                results = self.supersession_detector.run_all(
+                    include_implicit=self.enable_implicit_supersession
+                )
                 logger.info(f"Supersession detection results: {results}")
             except Exception as e:
                 logger.error(f"Error in supersession detection: {e}")

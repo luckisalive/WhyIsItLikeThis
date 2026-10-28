@@ -6,11 +6,72 @@ creating SUPERSEDES relationships and marking superseded decisions in Neo4j.
 
 import logging
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from src.graph.neo4j_manager import Neo4jManager
 
 logger = logging.getLogger(__name__)
+
+REVERT_TITLE_PAT = re.compile(r"^revert\b", re.IGNORECASE)
+REVERTS_PAT = re.compile(r"\breverts?\b[^\n\.\;]*?(?:[\w\-\.]+/[\w\-\.]+)?#(\d+)", re.IGNORECASE)
+SUPERSEDES_PAT = re.compile(r"\bsupersedes\b[^\n\.\;]*?(?:[\w\-\.]+/[\w\-\.]+)?#(\d+)", re.IGNORECASE)
+REPLACES_PAT = re.compile(r"\breplaces\b[^\n\.\;]*?(?:[\w\-\.]+/[\w\-\.]+)?#(\d+)", re.IGNORECASE)
+
+
+def extract_explicit_matches(text: str, title: str = "") -> List[Dict[str, Any]]:
+    """
+    Extract explicit supersession targets from text and title.
+    Rules:
+      1. Title starting with "Revert" (targets parsed if present).
+      2. "reverts #N" or "Reverts <repo>#N" with text allowed in between.
+      3. "supersedes #N" where N is PR/issue number.
+      4. "replaces #N" where N is PR/issue number.
+    Does NOT match general prose like "Replace the list comprehension".
+    """
+    matches: List[Dict[str, Any]] = []
+    seen = set()
+
+    # Rule 1: Title starting with "Revert"
+    clean_title = (title or "").strip()
+    if REVERT_TITLE_PAT.match(clean_title):
+        # Look for target number in title or text
+        m_target = REVERTS_PAT.search(clean_title) or REVERTS_PAT.search(text or "")
+        target_num = int(m_target.group(1)) if m_target else None
+        evidence_text = m_target.group(0) if m_target else clean_title
+        key = ("Title starting with 'Revert'", target_num, evidence_text)
+        if key not in seen:
+            seen.add(key)
+            matches.append({
+                "rule": "Title starting with 'Revert'",
+                "target_num": target_num,
+                "evidence_text": evidence_text,
+            })
+
+    # Rule 2, 3, 4: Scan title and text for reverts #N, supersedes #N, replaces #N
+    combined_texts = [clean_title, text or ""]
+    patterns = [
+        ("reverts #N", REVERTS_PAT),
+        ("supersedes #N", SUPERSEDES_PAT),
+        ("replaces #N", REPLACES_PAT),
+    ]
+
+    for block in combined_texts:
+        if not block:
+            continue
+        for rule_name, pat in patterns:
+            for m in pat.finditer(block):
+                target_num = int(m.group(1))
+                evidence_text = m.group(0)
+                key = (rule_name, target_num, evidence_text)
+                if key not in seen:
+                    seen.add(key)
+                    matches.append({
+                        "rule": rule_name,
+                        "target_num": target_num,
+                        "evidence_text": evidence_text,
+                    })
+
+    return matches
 
 
 class SupersessionDetector:
@@ -22,56 +83,91 @@ class SupersessionDetector:
         self.model = model
 
     def detect_explicit(self) -> int:
-        """Scan all decision titles, rationales, and PR bodies for explicit supersession keywords."""
-        query = "MATCH (d:Decision) WHERE d.status = 'ACTIVE' RETURN d"
-        try:
-            records = self.neo4j_mgr.execute_query(query)
-        except Exception as e:
-            logger.error(f"Error fetching decisions for explicit supersession detection: {e}")
-            return 0
-
+        """Scan PR titles/bodies and commit messages for explicit supersession keywords and create edges."""
         superseded_count = 0
-        patterns = [
-            r"supersedes\s+#?(\d+)",
-            r"replaces\s+#?(\d+)",
-            r"reverts\s+commit\s+([0-9a-fA-F]+)",
-            r"reverts\s+#?(\d+)",
-            r"deprecat(?:es|ing)\s+(.*)",
-            r"replaces\s+(.*)",
-        ]
+        try:
+            # Load PRs, Commits, Decisions with dates
+            prs_q = "MATCH (pr:PullRequest) RETURN pr.number AS num, pr.title AS title, pr.body AS body, pr.created_at AS date"
+            commits_q = "MATCH (c:Commit) RETURN c.sha AS sha, c.message AS msg, c.date AS date"
+            decs_q = """
+            MATCH (d:Decision)
+            OPTIONAL MATCH (d)-[:DISCUSSED_IN]->(pr:PullRequest)
+            OPTIONAL MATCH (d)-[:MOTIVATED_BY]->(iss:Issue)
+            OPTIONAL MATCH (d)-[:IMPLEMENTED_IN]->(c:Commit)
+            RETURN d.id AS id, d.title AS title,
+                   coalesce(pr.created_at, iss.created_at, c.date) AS date
+            """
 
-        for record in records:
-            d = record.get("d") or {}
-            d_id = d.get("id")
-            text = f"{d.get('title', '')} {d.get('rationale', '')} {d.get('decision_made', '')}".lower()
+            prs = self.neo4j_mgr.execute_query(prs_q) or []
+            commits = self.neo4j_mgr.execute_query(commits_q) or []
+            decs = {r["id"]: r for r in (self.neo4j_mgr.execute_query(decs_q) or []) if r.get("id")}
 
-            for pattern in patterns:
-                match = re.search(pattern, text)
-                if match:
-                    ref_target = match.group(1).strip()
-                    try:
-                        # Attempt to find an older decision related to the matched reference
-                        ref_query = """
-                        MATCH (old_d:Decision)
-                        WHERE old_d.id <> $current_id
-                          AND old_d.status = 'ACTIVE'
-                          AND (old_d.source_id CONTAINS $ref_target
-                               OR toLower(old_d.title) CONTAINS $ref_target)
-                        RETURN old_d.id AS old_id
-                        LIMIT 1
-                        """
-                        ref_records = self.neo4j_mgr.execute_query(ref_query, {"ref_target": ref_target, "current_id": d_id})
-                        if ref_records:
-                            old_id = ref_records[0]["old_id"]
-                            self.neo4j_mgr.mark_superseded(
-                                old_id=old_id,
-                                new_id=d_id,
-                                reason=f"Explicitly matches keyword pattern '{match.group(0)}'",
-                            )
-                            superseded_count += 1
-                            break
-                    except Exception as e:
-                        logger.error(f"Error linking explicit supersession for {d_id}: {e}")
+            raw_matches: List[Dict[str, Any]] = []
+
+            # 1. Scan PRs
+            for pr in prs:
+                num = pr.get("num")
+                if not num:
+                    continue
+                pr_matches = extract_explicit_matches(text=pr.get("body") or "", title=pr.get("title") or "")
+                for m in pr_matches:
+                    raw_matches.append({
+                        "source_dec_id": f"DEC-PR-{num}",
+                        "rule": m["rule"],
+                        "target_num": m["target_num"],
+                        "evidence_text": m["evidence_text"],
+                    })
+
+            # 2. Scan Commits
+            for c in commits:
+                sha = c.get("sha")
+                if not sha:
+                    continue
+                c_msg = c.get("msg") or ""
+                first_line = c_msg.split("\n")[0] if c_msg else ""
+                c_matches = extract_explicit_matches(text=c_msg, title=first_line)
+                for m in c_matches:
+                    raw_matches.append({
+                        "source_dec_id": f"DEC-COMMIT-{sha[:8]}",
+                        "rule": m["rule"],
+                        "target_num": m["target_num"],
+                        "evidence_text": m["evidence_text"],
+                    })
+
+            # Resolve edges
+            for m in raw_matches:
+                t_num = m.get("target_num")
+                if not t_num:
+                    continue
+
+                source_dec_id = m["source_dec_id"]
+                target_dec_id = f"DEC-PR-{t_num}"
+                target_dec = decs.get(target_dec_id)
+                if not target_dec:
+                    target_dec_id = f"DEC-ISSUE-{t_num}"
+                    target_dec = decs.get(target_dec_id)
+
+                src_dec = decs.get(source_dec_id)
+                if not src_dec or not target_dec:
+                    continue
+
+                src_date = str(src_dec.get("date") or "")
+                tgt_date = str(target_dec.get("date") or "")
+
+                # Temporal constraint: newer source date strictly later than target date
+                if src_date and tgt_date and src_date > tgt_date:
+                    self.neo4j_mgr.mark_superseded(
+                        old_id=target_dec_id,
+                        new_id=source_dec_id,
+                        reason=f"Explicit {m['rule']}: {m['evidence_text']}".strip(),
+                        detection_type="EXPLICIT",
+                        rule=m["rule"],
+                        evidence_text=m["evidence_text"],
+                    )
+                    superseded_count += 1
+
+        except Exception as e:
+            logger.error(f"Error during explicit supersession detection: {e}", exc_info=True)
 
         return superseded_count
 
@@ -131,10 +227,10 @@ class SupersessionDetector:
 
         return superseded_count
 
-    def run_all(self) -> Dict[str, int]:
-        """Runs both explicit and implicit supersession sweeps and returns statistics."""
+    def run_all(self, include_implicit: bool = False) -> Dict[str, int]:
+        """Runs supersession sweeps and returns statistics. By default, only explicit runs."""
         explicit_count = self.detect_explicit()
-        implicit_count = self.detect_implicit()
+        implicit_count = self.detect_implicit() if include_implicit else 0
         total = explicit_count + implicit_count
         logger.info(
             f"Supersession scan complete. Explicit: {explicit_count}, Implicit: {implicit_count}, Total: {total}"
